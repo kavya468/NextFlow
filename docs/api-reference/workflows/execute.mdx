@@ -1,0 +1,76 @@
+---
+title: "Execute Workflow"
+openapi: "POST /v1/workflows/{id}/execute"
+description: "Trigger a full execution instance of a specific workflow."
+---
+
+<ParamField path="id" type="string" required>
+  The unique identifier of the workflow.
+</ParamField>
+
+<ParamField body="inputs" type="object">
+  Dynamic inputs mapped by **node ID** to override original graph values.
+  Each key is a node ID and the value is an object of input overrides for that node.
+
+  ```json Example
+  {
+    "node_1": { "prompt": "A futuristic cityscape at sunset" },
+    "node_3": { "image_url": "https://example.com/photo.png" }
+  }
+  ```
+</ParamField>
+
+<ParamField body="variables" type="object">
+  Dynamic inputs mapped by **human-readable label** to override exposed inputs.
+  This allows you to execute templates without needing to know internal Node IDs.
+
+  ```json Example
+  {
+    "Prompt": "A futuristic cityscape at sunset",
+    "Image size": "16:9"
+  }
+  ```
+</ParamField>
+
+<ParamField body="webhookUrl" type="string">
+  Optional webhook URL to receive an asynchronous `POST` request upon workflow completion or failure.
+  
+  ```json Payload Example
+  {
+    "event": "run.completed",
+    "runId": "123-execution-run-id",
+    "status": "SUCCESS"
+  }
+  ```
+</ParamField>
+
+### Example Request
+
+```typescript
+const response = await fetch("https://next-flow-beta.vercel.app/api/v1/workflows/abc/execute", {
+  method: "POST",
+  headers: { "Authorization": "Bearer key", "Content-Type": "application/json" },
+  body: JSON.stringify({
+    inputs: {
+      "node_1": { prompt: "Override value" }
+    },
+    variables: {
+      "Prompt": "A futuristic cityscape at sunset"
+    },
+    webhookUrl: "https://your-domain.com/webhook/nextflow"
+  })
+});
+const { runId } = await response.json();
+```
+
+<ResponseExample>
+```json 200
+{
+  "runId": "123-execution-run-id",
+  "workflowId": "abc",
+  "scope": "FULL",
+  "nodeCount": 5,
+  "estimatedCredits": 1500
+}
+```
+</ResponseExample>

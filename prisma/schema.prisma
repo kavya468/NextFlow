@@ -1,0 +1,92 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String         @id // Clerk User ID
+  credits   Int            @default(0) // Microcredit balance (1,000,000 = $1.00)
+  workflows Workflow[]
+  runs      Run[]
+  ledger    CreditLedger[]
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+}
+
+model Workflow {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  nodes       Json     // React Flow nodes state
+  edges       Json     // React Flow edges state
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  runs        Run[]
+  visibility  String    @default("private")  // "private" | "published" | "unlisted"
+  thumbnail   String?                         // URL for gallery card image
+  category    String?                         // "image" | "video" | "audio" | "text"
+  usageCount  Int       @default(0)           // Denormalized run count for sorting
+  publishedAt DateTime?                       // When it was published to the gallery
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Run {
+  id          String         @id @default(uuid())
+  workflowId  String
+  workflow    Workflow        @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User            @relation(fields: [userId], references: [id])
+  scope       String          // 'FULL', 'PARTIAL', 'SINGLE'
+  status      String          // 'PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'PARTIAL'
+  inputValues Json?           // Label→value overrides for parameterized execution
+  triggerId   String?         // Trigger.dev Run/Execution ID for cancellations
+  durationMs  Int?
+  completedAt DateTime?       // Set when run reaches a terminal status
+  nodeRuns    NodeRun[]
+  ledger      CreditLedger[]
+  createdAt   DateTime        @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([workflowId])
+}
+
+model NodeRun {
+  id           String         @id @default(uuid())
+  runId        String
+  run          Run            @relation(fields: [runId], references: [id], onDelete: Cascade)
+  nodeId       String
+  nodeType     String
+  status       String         // 'PENDING', 'RUNNING', 'SUCCESS', 'FAILED'
+  inputs       Json?
+  outputs      Json?
+  error        String?
+  providerUsed String?        // e.g. "fal", "ffmpeg", "gemini"
+  creditsUsed  Int            @default(0)
+  durationMs   Int?
+  createdAt    DateTime       @default(now())
+  ledger       CreditLedger[]
+
+  @@index([runId, nodeId])
+}
+
+model CreditLedger {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id])
+  delta         Int      // Positive = top-up, negative = spend
+  reason        String   // e.g. "node:seedream-4.5", "reserve:run", "settle:node", "topup", "refund"
+  workflowRunId String?
+  run           Run?     @relation(fields: [workflowRunId], references: [id])
+  nodeRunId     String?
+  nodeRun       NodeRun? @relation(fields: [nodeRunId], references: [id])
+  createdAt     DateTime @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([workflowRunId])
+  @@index([nodeRunId])
+}

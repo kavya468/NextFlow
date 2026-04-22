@@ -1,0 +1,85 @@
+---
+title: "Execute Selected Nodes"
+openapi: "POST /v1/workflows/{id}/execute-selected"
+description: "Trigger a partial execution of a specific workflow by providing a subset of node identifiers."
+---
+
+<ParamField path="id" type="string" required>
+  The unique identifier of the workflow.
+</ParamField>
+
+<ParamField body="selectedNodeIds" type="string[]" required>
+  Array of Node IDs to execute. The system automatically scopes the execution to
+  these nodes and their upstream dependencies.
+
+  ```json Example
+  ["node_4", "node_5"]
+  ```
+</ParamField>
+
+<ParamField body="inputs" type="object">
+  Dynamic inputs mapped by **node ID** to override original graph values.
+  Each key is a node ID and the value is an object of input overrides for that node.
+
+  ```json Example
+  {
+    "node_4": { "image_url": "https://example.com/asset.png" }
+  }
+  ```
+</ParamField>
+
+<ParamField body="variables" type="object">
+  Dynamic inputs mapped by **human-readable label** to override exposed inputs.
+  This allows you to execute templates without needing to know internal Node IDs.
+
+  ```json Example
+  {
+    "Prompt": "A futuristic cityscape at sunset",
+    "Image size": "16:9"
+  }
+  ```
+</ParamField>
+
+<ParamField body="webhookUrl" type="string">
+  Optional webhook URL to receive an asynchronous `POST` request upon workflow completion or failure.
+  
+  ```json Payload Example
+  {
+    "event": "run.completed",
+    "runId": "123-execution-run-id",
+    "status": "SUCCESS"
+  }
+  ```
+</ParamField>
+
+### Example Request
+
+```typescript
+const response = await fetch("https://next-flow-beta.vercel.app/api/v1/workflows/abc/execute-selected", {
+  method: "POST",
+  headers: { "Authorization": "Bearer key", "Content-Type": "application/json" },
+  body: JSON.stringify({
+    selectedNodeIds: ["node_4", "node_5"],
+    inputs: {
+      "node_4": { image_url: "https://example.com/asset.png" }
+    },
+    variables: {
+      "Prompt": "A futuristic cityscape at sunset"
+    },
+    webhookUrl: "https://your-domain.com/webhook/nextflow"
+  })
+});
+const { runId } = await response.json();
+```
+
+<ResponseExample>
+```json 200
+{
+  "runId": "123-execution-run-id",
+  "workflowId": "abc",
+  "scope": "PARTIAL",
+  "nodeCount": 2,
+  "estimatedCredits": 500
+}
+```
+</ResponseExample>

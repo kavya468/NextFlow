@@ -1,0 +1,62 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "NextFlow",
+  "colors": {
+    "primary": "#0F172A",
+    "light": "#F8FAFC",
+    "dark": "#0B0F19"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "introduction",
+          "authentication",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "API Reference",
+        "pages": [
+          "api-reference/workflows/list",
+          "api-reference/workflows/get",
+          "api-reference/workflows/execute",
+          "api-reference/workflows/execute-selected",
+          "api-reference/executions/get",
+          "api-reference/credits/get"
+        ]
+      },
+      {
+        "group": "SDKs & Tools",
+        "pages": [
+          "api-reference/openapi"
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "api": {
+    "baseUrl": "https://next-flow-beta.vercel.app",
+    "openapi": "https://next-flow-beta.vercel.app/api/v1/openapi.json",
+    "mdx": {
+      "server": "https://next-flow-beta.vercel.app/api",
+      "auth": {
+        "method": "bearer"
+      }
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "mailto:hi@nextflow.com"
+      }
+    ]
+  }
+}

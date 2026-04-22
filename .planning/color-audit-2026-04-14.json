@@ -1,0 +1,25 @@
+{
+  "session": "color-audit-2026-04-14",
+  "status": "Phase 4 - Verification & Validations Completed",
+  "files_audited": [
+    "components/nodes/CropNode.tsx",
+    "components/nodes/GenericNode.tsx",
+    "components/WorkflowCard.tsx",
+    "components/ui/sheet.tsx",
+    "components/ui/dialog.tsx",
+    "components/canvas/SaveStatusIndicator.tsx",
+    "components/history/NodeRow.tsx",
+    "components/history/NodeOutput.tsx",
+    "components/builder/BuilderPage.tsx",
+    "components/credits/PreRunModal.tsx"
+  ],
+  "findings": {
+    "hardcoded_colors_count": 39,
+    "ux_antipatterns_found": [
+      "Hardcoded blacks/whites on containers preventing light mode fallback.",
+      "text-white failing WCAG AA on light mode canvas (#f0ede8).",
+      "Overuse of arbitrary alphas causing muddy contrast ratios.",
+      "Modal surfaces defining their own bg-zinc-950 context instead of inheriting from theme."
+    ]
+  }
+}

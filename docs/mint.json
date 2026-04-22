@@ -1,0 +1,58 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "NextFlow",
+  "logo": {
+    "dark": "/logo/dark.svg",
+    "light": "/logo/light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#0F172A",
+    "light": "#F8FAFC",
+    "dark": "#0B0F19",
+    "anchors": {
+      "from": "#0F172A",
+      "to": "#334155"
+    }
+  },
+  "topbarLinks": [
+    {
+      "name": "Support",
+      "url": "mailto:hi@nextflow.com"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "Get Started",
+      "pages": [
+        "introduction",
+        "authentication",
+        "quickstart"
+      ]
+    },
+    {
+      "group": "API Reference",
+      "pages": [
+        "api-reference/workflows/list",
+        "api-reference/workflows/get",
+        "api-reference/workflows/execute",
+        "api-reference/workflows/execute-selected",
+        "api-reference/executions/get",
+        "api-reference/credits/get"
+      ]
+    },
+    {
+      "group": "SDKs & Tools",
+      "pages": [
+        "api-reference/openapi"
+      ]
+    }
+  ],
+  "api": {
+    "baseUrl": "https://next-flow-beta.vercel.app",
+    "auth": {
+      "method": "bearer"
+    }
+  },
+ "openapi": "https://next-flow-beta.vercel.app/api/v1/openapi.json"
+}

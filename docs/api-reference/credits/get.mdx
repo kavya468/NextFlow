@@ -1,0 +1,27 @@
+---
+title: "Get Credits"
+openapi: "GET /v1/credits"
+description: "Retrieve your current API and platform credit balance."
+---
+
+## Authentication
+
+Requires a Bearer token.
+
+### Example Request
+
+```bash
+curl -X GET "https://next-flow-beta.vercel.app/api/v1/credits" \
+  -H "Authorization: Bearer nf_YOUR_API_KEY"
+```
+
+## Response
+
+Returns the numeric balance and a formatted human-readable string.
+
+```json
+{
+  "balance": 1500000,
+  "formatted": "15,000.00"
+}
+```

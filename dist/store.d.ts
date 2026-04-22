@@ -1,0 +1,41 @@
+import { Edge, Node, OnNodesChange, OnEdgesChange, OnConnect } from "@xyflow/react";
+export type AppNode = Node;
+export type { Edge };
+type Snapshot = {
+    nodes: AppNode[];
+    edges: Edge[];
+};
+export type NodeRunStatus = "PENDING" | "RUNNING" | "SUCCESS" | "FAILED";
+export type AppState = {
+    nodes: AppNode[];
+    edges: Edge[];
+    runningNodeIds: string[];
+    nodeRunStatuses: Record<string, NodeRunStatus>;
+    isRightSidebarOpen: boolean;
+    snapToGrid: boolean;
+    clipboard: {
+        nodes: AppNode[];
+        edges: Edge[];
+    };
+    past: Snapshot[];
+    future: Snapshot[];
+    onNodesChange: OnNodesChange<AppNode>;
+    onEdgesChange: OnEdgesChange;
+    onConnect: OnConnect;
+    setNodes: (nodes: AppNode[]) => void;
+    setEdges: (edges: Edge[]) => void;
+    setRunningNodeIds: (ids: string[]) => void;
+    setNodeRunStatuses: (statuses: Record<string, NodeRunStatus>) => void;
+    clearNodeRunStatuses: () => void;
+    setIsRightSidebarOpen: (isOpen: boolean) => void;
+    setSnapToGrid: (snap: boolean) => void;
+    autoLayout: () => void;
+    takeSnapshot: () => void;
+    undo: () => void;
+    redo: () => void;
+    canUndo: () => boolean;
+    canRedo: () => boolean;
+    copySelection: () => void;
+    pasteSelection: () => void;
+};
+export declare const useStore: import("zustand").UseBoundStore<import("zustand").StoreApi<AppState>>;

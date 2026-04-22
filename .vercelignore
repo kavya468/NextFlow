@@ -1,0 +1,20 @@
+# Skill templates and reference files (not part of app)
+antigravity-skills/
+.agents/
+.claude/
+.gemini/
+.planning/
+.ruler/
+
+# Build artifacts
+dist/
+.trigger/
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Misc
+.DS_Store
+*.sql
