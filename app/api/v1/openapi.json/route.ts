@@ -18,5 +18,35 @@ export function GET() {
     },
   });
 
+  // ── Post-process: inject request body examples for Mintlify playground ──
+  const paths = (doc as any).paths ?? {};
+
+  const executePath = paths["/v1/workflows/{id}/execute"];
+  if (executePath?.post?.requestBody?.content?.["application/json"]) {
+    executePath.post.requestBody.content["application/json"].example = {
+      variables: {
+        "text": { text: "Explain why pineapple belongs on pizza." }
+      },
+      webhook: {
+        url: "https://webhook.site/your-unique-id",
+        events: ["run.completed", "run.failed"]
+      }
+    };
+  }
+
+  const executeSelectedPath = paths["/v1/workflows/{id}/execute-selected"];
+  if (executeSelectedPath?.post?.requestBody?.content?.["application/json"]) {
+    executeSelectedPath.post.requestBody.content["application/json"].example = {
+      selectedNodeIds: ["hero-image", "hero-crop"],
+      variables: {
+        "text": { text: "Explain why pineapple belongs on pizza." }
+      },
+      webhook: {
+        url: "https://webhook.site/your-unique-id",
+        events: ["run.completed", "run.failed"]
+      }
+    };
+  }
+
   return NextResponse.json(doc);
 }

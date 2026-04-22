@@ -53,28 +53,25 @@ export const publicApiRouter = createPublicApiRouter({
       z.object({
         id: z.string(),
         inputs: z
-          .record(z.string(), z.unknown())
+          .record(z.string(), z.record(z.string(), z.any()))
           .optional()
-          .meta({
-            description:
-              "Dynamic inputs mapped by node ID to override original graph values.",
-            examples: [
-              {
-                node_1: { prompt: "A futuristic cityscape at sunset" },
-              },
-            ],
-          }),
+          .describe(
+            "Low-level overrides by node ID. Keys are internal node IDs, values are objects of field overrides. Works for ANY field on ANY node regardless of exposure. Use GET /v1/workflows/{id} to inspect node IDs."
+          ),
         variables: z
-          .record(z.string(), z.unknown())
+          .record(z.string(), z.record(z.string(), z.any()))
           .optional()
-          .meta({
-            description:
-              "Dynamic inputs mapped by human-readable label to override exposed inputs.",
-            examples: [{ Prompt: "A futuristic cityscape at sunset" }],
-          }),
-        webhookUrl: z.string().url().optional().meta({
-          description: "Optional webhook URL to receive a POST request upon completion.",
-        }),
+          .describe(
+            "Override exposed inputs by node label. Keys MUST match the exact node label from the canvas editor (node.data.label). Only works for passthrough nodes (auto-exposed) and fields marked as exposed via exposedInputKeys. Non-matching keys are silently ignored."
+          ),
+        webhook: z.object({
+          url: z.string().url().describe("The URL to receive POST notifications."),
+          events: z.array(
+            z.enum(["run.completed", "run.failed"])
+          ).optional().describe("Which events to subscribe to. Defaults to all."),
+        }).optional().describe(
+          "Webhook configuration for async completion notifications."
+        ),
       })
     )
     .output(z.object({ runId: z.string(), workflowId: z.string(), scope: z.string(), nodeCount: z.number(), estimatedCredits: z.number() }))
@@ -94,12 +91,28 @@ export const publicApiRouter = createPublicApiRouter({
         }
       }
 
+      const flattenedVariables: Record<string, any> = {};
+      if (input.variables) {
+        for (const [label, fields] of Object.entries(input.variables)) {
+          if (typeof fields === "object" && fields !== null) {
+            for (const [field, value] of Object.entries(fields as Record<string, any>)) {
+              flattenedVariables[`${label}.${field}`] = value;
+            }
+          } else {
+            flattenedVariables[label] = fields;
+          }
+        }
+      }
+
+      console.log("[API DEBUG] executeWorkflow received input.variables:", input.variables);
+      console.log("[API DEBUG] executeWorkflow flattenedVariables:", flattenedVariables);
+
       const res = await caller.workflow.execute({
         workflowId: workflow.id,
         nodes: nodes,
         edges: workflow.edges as any,
-        inputValues: input.variables,
-        webhookUrl: input.webhookUrl,
+        inputValues: Object.keys(flattenedVariables).length > 0 ? flattenedVariables : undefined,
+        webhookUrl: input.webhook?.url,
       });
       return {
         runId: res.runId,
@@ -130,28 +143,25 @@ export const publicApiRouter = createPublicApiRouter({
           examples: [["node_4", "node_5"]],
         }),
         inputs: z
-          .record(z.string(), z.unknown())
+          .record(z.string(), z.record(z.string(), z.any()))
           .optional()
-          .meta({
-            description:
-              "Dynamic inputs mapped by node ID to override original graph values.",
-            examples: [
-              {
-                node_4: { image_url: "https://example.com/asset.png" },
-              },
-            ],
-          }),
+          .describe(
+            "Low-level overrides by node ID. Keys are internal node IDs, values are objects of field overrides. Works for ANY field on ANY node regardless of exposure."
+          ),
         variables: z
-          .record(z.string(), z.unknown())
+          .record(z.string(), z.record(z.string(), z.any()))
           .optional()
-          .meta({
-            description:
-              "Dynamic inputs mapped by human-readable label to override exposed inputs.",
-            examples: [{ Prompt: "A futuristic cityscape at sunset" }],
-          }),
-        webhookUrl: z.string().url().optional().meta({
-          description: "Optional webhook URL to receive a POST request upon completion.",
-        }),
+          .describe(
+            "Override exposed inputs by node label. Keys MUST match the exact node label from the canvas editor. Only works for exposed inputs — non-matching keys are silently ignored."
+          ),
+        webhook: z.object({
+          url: z.string().url().describe("The URL to receive POST notifications."),
+          events: z.array(
+            z.enum(["run.completed", "run.failed"])
+          ).optional().describe("Which events to subscribe to. Defaults to all."),
+        }).optional().describe(
+          "Webhook configuration for async completion notifications."
+        ),
       })
     )
     .output(z.object({ runId: z.string(), workflowId: z.string(), scope: z.string(), nodeCount: z.number(), estimatedCredits: z.number() }))
@@ -171,13 +181,26 @@ export const publicApiRouter = createPublicApiRouter({
         }
       }
 
+      const flattenedVariables: Record<string, any> = {};
+      if (input.variables) {
+        for (const [label, fields] of Object.entries(input.variables)) {
+          if (typeof fields === "object" && fields !== null) {
+            for (const [field, value] of Object.entries(fields as Record<string, any>)) {
+              flattenedVariables[`${label}.${field}`] = value;
+            }
+          } else {
+            flattenedVariables[label] = fields;
+          }
+        }
+      }
+
       const res = await caller.workflow.execute({
         workflowId: workflow.id,
         nodes: nodes,
         edges: workflow.edges as any,
         selectedNodeIds: input.selectedNodeIds,
-        inputValues: input.variables,
-        webhookUrl: input.webhookUrl,
+        inputValues: Object.keys(flattenedVariables).length > 0 ? flattenedVariables : undefined,
+        webhookUrl: input.webhook?.url,
       });
       
       return {

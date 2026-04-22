@@ -1,82 +1,132 @@
 ---
 title: "Execute Selected Nodes"
 openapi: "POST /v1/workflows/{id}/execute-selected"
-description: "Trigger a partial execution of a specific workflow by providing a subset of node identifiers."
 ---
 
-<ParamField path="id" type="string" required>
-  The unique identifier of the workflow.
-</ParamField>
+## Partial Execution
 
-<ParamField body="selectedNodeIds" type="string[]" required>
-  Array of Node IDs to execute. The system automatically scopes the execution to
-  these nodes and their upstream dependencies.
+Run only specific nodes (and their upstream dependencies) from a workflow. The system
+automatically discovers and includes all upstream nodes needed to satisfy the selected nodes' inputs.
 
-  ```json Example
-  ["node_4", "node_5"]
-  ```
-</ParamField>
+---
 
-<ParamField body="inputs" type="object">
-  Dynamic inputs mapped by **node ID** to override original graph values.
-  Each key is a node ID and the value is an object of input overrides for that node.
+### `selectedNodeIds` — Required
 
-  ```json Example
-  {
-    "node_4": { "image_url": "https://example.com/asset.png" }
+Specify which nodes to execute by their internal node IDs. All upstream dependencies are
+included automatically.
+
+```json
+{
+  "selectedNodeIds": ["hero-image", "hero-crop"]
+}
+```
+
+---
+
+### `variables` — Override Exposed Inputs by Label ✨
+
+Override values for inputs that have been **exposed** in the canvas editor. Keys must match
+the exact node **label** — not the node ID.
+
+<Warning>
+  `variables` **only works with exposed inputs**. If the node label doesn't match any
+  exposed input, the override is silently ignored. Use `inputs` for non-exposed fields.
+</Warning>
+
+#### Passthrough node override
+
+If your text node has the default label `"text"`:
+
+```json
+{
+  "variables": {
+    "text": {
+      "text": "A revolutionary AR headset for designers"
+    }
   }
-  ```
-</ParamField>
+}
+```
 
-<ParamField body="variables" type="object">
-  Dynamic inputs mapped by **human-readable label** to override exposed inputs.
-  This allows you to execute templates without needing to know internal Node IDs.
+#### Explicitly exposed field override
 
-  ```json Example
-  {
-    "Prompt": "A futuristic cityscape at sunset",
-    "Image size": "16:9"
+If an LLM node labeled `"Writer"` has `system_prompt` exposed:
+
+```json
+{
+  "variables": {
+    "Writer": {
+      "system_prompt": "Write in a casual, Gen-Z tone"
+    }
   }
-  ```
-</ParamField>
+}
+```
 
-<ParamField body="webhookUrl" type="string">
-  Optional webhook URL to receive an asynchronous `POST` request upon workflow completion or failure.
-  
-  ```json Payload Example
-  {
-    "event": "run.completed",
-    "runId": "123-execution-run-id",
-    "status": "SUCCESS"
+<Tip>
+  Check your node labels in the canvas editor. The label shown on the node header is the
+  exact key you need to use in `variables`.
+</Tip>
+
+---
+
+### `inputs` — Override Any Field by Node ID
+
+Override **any** field on **any** node by targeting the internal node ID. Works for all
+fields regardless of exposure status.
+
+```json
+{
+  "inputs": {
+    "reviewer_llm": {
+      "model": "openai/gpt-4o",
+      "system_prompt": "Be concise and critical."
+    }
   }
-  ```
-</ParamField>
+}
+```
 
-### Example Request
+---
 
-```typescript
-const response = await fetch("https://next-flow-beta.vercel.app/api/v1/workflows/abc/execute-selected", {
-  method: "POST",
-  headers: { "Authorization": "Bearer key", "Content-Type": "application/json" },
-  body: JSON.stringify({
-    selectedNodeIds: ["node_4", "node_5"],
-    inputs: {
-      "node_4": { image_url: "https://example.com/asset.png" }
+### `webhook` — Async Notification
+
+Receive `POST` requests when the partial execution completes or fails.
+
+```json
+{
+  "webhook": {
+    "url": "https://your-app.com/api/webhook/nextflow",
+    "events": ["run.completed", "run.failed"]
+  }
+}
+```
+
+---
+
+## Full Example
+
+```bash
+curl --request POST \
+  --url https://next-flow-beta.vercel.app/api/v1/workflows/YOUR_WORKFLOW_ID/execute-selected \
+  --header 'Authorization: Bearer nf_YOUR_API_KEY' \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "selectedNodeIds": ["hero-image", "hero-crop"],
+    "variables": {
+      "text": {
+        "text": "A revolutionary AR headset for designers"
+      }
     },
-    variables: {
-      "Prompt": "A futuristic cityscape at sunset"
-    },
-    webhookUrl: "https://your-domain.com/webhook/nextflow"
-  })
-});
-const { runId } = await response.json();
+    "webhook": {
+      "url": "https://webhook.site/your-unique-id",
+      "events": ["run.completed", "run.failed"]
+    }
+  }'
 ```
 
 <ResponseExample>
 ```json 200
 {
-  "runId": "123-execution-run-id",
-  "workflowId": "abc",
+  "runId": "run_abc123",
+  "workflowId": "wf_xyz",
   "scope": "PARTIAL",
   "nodeCount": 2,
   "estimatedCredits": 500
