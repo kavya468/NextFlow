@@ -2,7 +2,8 @@ import { z } from "zod";
 import { createPublicApiRouter, publicApiProcedure } from "../trpc";
 import { appRouter } from "../root";
 import { TRPCError } from "@trpc/server";
-
+import { getExposedInputs } from "../../../lib/nodes/exposed-inputs";
+import { nodeRegistry } from "../../../lib/nodes/registry";
 export const publicApiRouter = createPublicApiRouter({
   listWorkflows: publicApiProcedure
     .meta({
@@ -59,7 +60,7 @@ export const publicApiRouter = createPublicApiRouter({
             "Low-level overrides by node ID. Keys are internal node IDs, values are objects of field overrides. Works for ANY field on ANY node regardless of exposure. Use GET /v1/workflows/{id} to inspect node IDs."
           ),
         variables: z
-          .record(z.string(), z.record(z.string(), z.any()))
+          .record(z.string(), z.any())
           .optional()
           .describe(
             "Override exposed inputs by node label. Keys MUST match the exact node label from the canvas editor (node.data.label). Only works for passthrough nodes (auto-exposed) and fields marked as exposed via exposedInputKeys. Non-matching keys are silently ignored."
@@ -82,36 +83,65 @@ export const publicApiRouter = createPublicApiRouter({
       if (!workflow) throw new TRPCError({ code: "NOT_FOUND" });
       
       const nodes = workflow.nodes as any[];
-      if (input.inputs && nodes) {
+
+      // ── 1. Map `inputs` (by node ID) to flattened overrides ────────
+      const flattenedOverrides: Record<string, any> = {};
+      const flattenedVariables: Record<string, any> = {};
+      
+      if (input.inputs) {
         for (const [nodeId, nodeData] of Object.entries(input.inputs)) {
-          const node = nodes.find(n => n.id === nodeId);
-          if (node) {
-            node.data = { ...node.data, ...((nodeData as any) || {}) };
+          if (typeof nodeData === "object" && nodeData !== null) {
+            for (const [field, value] of Object.entries(nodeData as Record<string, any>)) {
+              flattenedOverrides[`${nodeId}.${field}`] = value;
+            }
           }
         }
       }
 
-      const flattenedVariables: Record<string, any> = {};
+      // ── 2. Map `variables` (by node label) to flattened overrides ──
       if (input.variables) {
+        const { inputs: exposedInputs } = getExposedInputs(nodes, nodeRegistry);
+
         for (const [label, fields] of Object.entries(input.variables)) {
           if (typeof fields === "object" && fields !== null) {
             for (const [field, value] of Object.entries(fields as Record<string, any>)) {
               flattenedVariables[`${label}.${field}`] = value;
             }
           } else {
-            flattenedVariables[label] = fields;
+            // First check if 'label' perfectly matches an exposed input (e.g., passthrough or exact label.key)
+            if (exposedInputs.some((ei) => ei.label === label)) {
+              flattenedVariables[label] = fields;
+            } else {
+              // Fuzzy match: if user provided just the node label (e.g., "OpenRouter LLM"), 
+              // and that node only exposes exactly ONE input, map it automatically.
+              const matchingExposed = exposedInputs.filter((ei) => {
+                const nodeLabel = nodes.find((n) => n.id === ei.nodeId)?.data?.label || ei.nodeType;
+                return nodeLabel === label;
+              });
+
+              if (matchingExposed.length === 1) {
+                flattenedVariables[matchingExposed[0].label] = fields;
+              } else {
+                // Fallback (will likely be ignored by the orchestrator)
+                flattenedVariables[label] = fields;
+              }
+            }
           }
         }
       }
 
-      console.log("[API DEBUG] executeWorkflow received input.variables:", input.variables);
-      console.log("[API DEBUG] executeWorkflow flattenedVariables:", flattenedVariables);
+      // Merge both types of overrides into a single record for the orchestrator
+      const inputValues = { ...flattenedOverrides, ...flattenedVariables };
+
+      console.log("[API] Runtime overrides prepared:", Object.keys(inputValues));
 
       const res = await caller.workflow.execute({
         workflowId: workflow.id,
-        nodes: nodes,
+        // We pass the ORIGINAL nodes from the DB. 
+        // The orchestrator will apply inputValues at runtime.
+        nodes: nodes, 
         edges: workflow.edges as any,
-        inputValues: Object.keys(flattenedVariables).length > 0 ? flattenedVariables : undefined,
+        inputValues: Object.keys(inputValues).length > 0 ? inputValues : undefined,
         webhookUrl: input.webhook?.url,
       });
       return {
@@ -149,7 +179,7 @@ export const publicApiRouter = createPublicApiRouter({
             "Low-level overrides by node ID. Keys are internal node IDs, values are objects of field overrides. Works for ANY field on ANY node regardless of exposure."
           ),
         variables: z
-          .record(z.string(), z.record(z.string(), z.any()))
+          .record(z.string(), z.any())
           .optional()
           .describe(
             "Override exposed inputs by node label. Keys MUST match the exact node label from the canvas editor. Only works for exposed inputs — non-matching keys are silently ignored."
@@ -172,34 +202,59 @@ export const publicApiRouter = createPublicApiRouter({
       if (!workflow) throw new TRPCError({ code: "NOT_FOUND" });
       
       const nodes = workflow.nodes as any[];
-      if (input.inputs && nodes) {
+
+      // ── 1. Map `inputs` (by node ID) to flattened overrides ────────
+      const flattenedOverrides: Record<string, any> = {};
+      const flattenedVariables: Record<string, any> = {};
+      
+      if (input.inputs) {
         for (const [nodeId, nodeData] of Object.entries(input.inputs)) {
-          const node = nodes.find(n => n.id === nodeId);
-          if (node) {
-            node.data = { ...node.data, ...((nodeData as any) || {}) };
+          if (typeof nodeData === "object" && nodeData !== null) {
+            for (const [field, value] of Object.entries(nodeData as Record<string, any>)) {
+              flattenedOverrides[`${nodeId}.${field}`] = value;
+            }
           }
         }
       }
 
-      const flattenedVariables: Record<string, any> = {};
+      // ── 2. Map `variables` (by node label) to flattened overrides ──
       if (input.variables) {
+        const { inputs: exposedInputs } = getExposedInputs(nodes, nodeRegistry);
+
         for (const [label, fields] of Object.entries(input.variables)) {
           if (typeof fields === "object" && fields !== null) {
             for (const [field, value] of Object.entries(fields as Record<string, any>)) {
               flattenedVariables[`${label}.${field}`] = value;
             }
           } else {
-            flattenedVariables[label] = fields;
+            // First check if 'label' perfectly matches an exposed input
+            if (exposedInputs.some((ei) => ei.label === label)) {
+              flattenedVariables[label] = fields;
+            } else {
+              // Fuzzy match: if user provided just the node label and it has exactly ONE exposed input
+              const matchingExposed = exposedInputs.filter((ei) => {
+                const nodeLabel = nodes.find((n) => n.id === ei.nodeId)?.data?.label || ei.nodeType;
+                return nodeLabel === label;
+              });
+
+              if (matchingExposed.length === 1) {
+                flattenedVariables[matchingExposed[0].label] = fields;
+              } else {
+                flattenedVariables[label] = fields;
+              }
+            }
           }
         }
       }
+
+      const inputValues = { ...flattenedOverrides, ...flattenedVariables };
 
       const res = await caller.workflow.execute({
         workflowId: workflow.id,
         nodes: nodes,
         edges: workflow.edges as any,
         selectedNodeIds: input.selectedNodeIds,
-        inputValues: Object.keys(flattenedVariables).length > 0 ? flattenedVariables : undefined,
+        inputValues: Object.keys(inputValues).length > 0 ? inputValues : undefined,
         webhookUrl: input.webhook?.url,
       });
       

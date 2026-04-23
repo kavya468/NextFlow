@@ -81,6 +81,11 @@ export const orchestrateWorkflow = task({
     // this execution's in-memory representation. The workflow template is
     // untouched in the database.
     if (payload.inputValues && Object.keys(payload.inputValues).length > 0) {
+      logger.info("Found runtime input overrides", { 
+        count: Object.keys(payload.inputValues).length,
+        keys: Object.keys(payload.inputValues) 
+      });
+
       // Track which override labels resolved to which node IDs
       // to detect multi-match corruption
       const labelMatchTracker = new Map<string, string[]>();
@@ -90,6 +95,7 @@ export const orchestrateWorkflow = task({
         const config = nodeRegistry.get(node.type);
         if (!config) continue;
 
+        // Ensure fallback logic matches lib/nodes/exposed-inputs.ts exactly
         const nodeLabel = (node.data?.label as string) || node.type;
 
         // ── Mode 1: Passthrough label-match (backward compatible) ──────
@@ -104,46 +110,51 @@ export const orchestrateWorkflow = task({
             const overrideValue = payload.inputValues[nodeLabel];
             const dataKeys = Object.keys(config.passthroughMapping);
             if (dataKeys.length > 0) {
-              node.data[dataKeys[0]] = overrideValue;
-              logger.info("Applied passthrough input override", {
-                nodeId: node.id,
-                label: nodeLabel,
-                dataKey: dataKeys[0],
+              const targetKey = dataKeys[0];
+              logger.info(`Applying Passthrough override [${nodeLabel}] -> ${targetKey}`, { 
+                nodeId: node.id, 
+                value: typeof overrideValue === 'string' ? overrideValue.substring(0, 50) : overrideValue 
               });
+              if (!node.data) node.data = {};
+              node.data[targetKey] = overrideValue;
             }
           }
         }
 
-        // ── Mode 2: Explicit compound label "nodeLabel.inputKey" ────────
-        // Scans all inputValues for keys matching this node's label prefix.
+        // ── Mode 2: Explicit label.inputKey override ───────────────────
         const labelPrefix = `${nodeLabel}.`;
         for (const [overrideKey, overrideValue] of Object.entries(payload.inputValues)) {
           if (!overrideKey.startsWith(labelPrefix)) continue;
+
           const inputKey = overrideKey.slice(labelPrefix.length);
-          if (!inputKey) continue;
-
-          // Verify this input key exists in the node's config
-          const inputDef = config.inputs?.find((inp) => inp.key === inputKey);
-          if (!inputDef) {
-            logger.warn("Skipping override for unknown input key", {
-              nodeId: node.id,
-              label: nodeLabel,
-              inputKey,
-            });
-            continue;
-          }
-
-          node.data[inputKey] = overrideValue;
-          logger.info("Applied explicit input override", {
-            nodeId: node.id,
-            label: nodeLabel,
+          logger.info(`Applying Label.Key override [${overrideKey}]`, { 
+            nodeId: node.id, 
             inputKey,
+            value: typeof overrideValue === 'string' ? overrideValue.substring(0, 50) : overrideValue 
           });
+          if (!node.data) node.data = {};
+          node.data[inputKey] = overrideValue;
+        }
+
+        // ── Mode 3: Explicit nodeId.inputKey override ────────────────────
+        // Highest precision: bypasses label collisions entirely.
+        const idPrefix = `${node.id}.`;
+        for (const [overrideKey, overrideValue] of Object.entries(payload.inputValues)) {
+          if (!overrideKey.startsWith(idPrefix)) continue;
+
+          const inputKey = overrideKey.slice(idPrefix.length);
+          logger.info(`Applying NodeId.Key override [${overrideKey}]`, { 
+            nodeId: node.id, 
+            inputKey,
+            value: typeof overrideValue === 'string' ? overrideValue.substring(0, 50) : overrideValue 
+          });
+          if (!node.data) node.data = {};
+          node.data[inputKey] = overrideValue;
         }
       }
 
-      // ── Warn on multi-match labels (data corruption indicator) ────────
-      for (const [label, matchedNodeIds] of labelMatchTracker) {
+      // Check for multi-match corruption warnings
+      for (const [label, matchedNodeIds] of labelMatchTracker.entries()) {
         if (matchedNodeIds.length > 1) {
           logger.warn("⚠️ DUPLICATE LABEL DETECTED — override applied to multiple nodes", {
             label,
@@ -154,6 +165,8 @@ export const orchestrateWorkflow = task({
           });
         }
       }
+    } else {
+      logger.info("No runtime input overrides provided");
     }
 
 
@@ -363,9 +376,37 @@ export const orchestrateWorkflow = task({
             delete inputs[key]; // Clean up tracking key
           }
 
-          // Merge node.data (user-entered values) with wired upstream values.
-          // Upstream connections take precedence over static data.
-          const finalInputs: Record<string, unknown> = { ...node.data, ...inputs };
+          // Merge node.data (default values) with wired upstream values.
+          // Upstream connections take precedence over static canvas data.
+          let finalInputs: Record<string, unknown> = { ...node.data, ...inputs };
+
+          // ── Runtime Override Re-Injection (Precedence Fix) ──────────────
+          // If the user provided runtime overrides (API/Template UI), these
+          // MUST prevail over even the edge wiring. This ensures that
+          // "Exposed Inputs" in the UI behave as the absolute source of truth.
+          if (payload.inputValues) {
+            const nodeLabel = (node.data?.label as string) || node.type;
+            const config = nodeRegistry.get(node.type);
+
+            // Re-apply same logic as Step 0 to finalInputs
+            // Mode 1: Passthrough label
+            if (config?.isPassthrough && config.passthroughMapping && nodeLabel in payload.inputValues) {
+              const targetKey = Object.keys(config.passthroughMapping)[0];
+              finalInputs[targetKey] = payload.inputValues[nodeLabel];
+            }
+            // Mode 2: Label.Key
+            const labelPrefix = `${nodeLabel}.`;
+            // Mode 3: NodeId.Key
+            const idPrefix = `${node.id}.`;
+
+            for (const [k, v] of Object.entries(payload.inputValues)) {
+              if (k.startsWith(labelPrefix)) {
+                finalInputs[k.slice(labelPrefix.length)] = v;
+              } else if (k.startsWith(idPrefix)) {
+                finalInputs[k.slice(idPrefix.length)] = v;
+              }
+            }
+          }
 
           // Sanitize any array inputs to remove undefined/null/empty strings.
           // This prevents PrismaClientValidationError when empty connection

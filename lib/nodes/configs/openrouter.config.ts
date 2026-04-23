@@ -50,7 +50,7 @@ export const openrouterConfig: NodeConfig = {
       label: "Max Tokens",
       required: false,
       isAdvanced: true,
-      default: 1024,
+      default: 512,
       description: "Maximum number of tokens to generate",
       validation: { min: 1, max: 8192 },
     },

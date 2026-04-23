@@ -16,7 +16,7 @@ const openRouterInputSchema = z.object({
   system_prompt: z.string().optional(),
   user_message: z.string().trim().min(1, "User Message is required"),
   images: z.array(z.string()).optional(),
-  max_tokens: z.number().int().min(1).max(8192).default(1024),
+  max_tokens: z.number().int().min(1).max(8192).default(512),
   temperature: z.number().min(0).max(2).default(0.7),
 });
 
