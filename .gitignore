@@ -16,6 +16,7 @@
 # next.js
 /.next/
 /out/
+
 # Local AI & MCP Configurations
 .claude/
 .cursor/
@@ -39,7 +40,7 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files
 .env*
 
 # vercel
@@ -55,9 +56,61 @@ next-env.d.ts
 .trigger/
 
 # Tool Artifacts
-.gemini
+.gemini/
 .env*.local
 /docs/api-deep-dive
 galaxyai.pdf
 /.agent/skills
 
+# AI Agent Configurations
+.agents/
+.planning/
+.ruler/
+.cursorrules
+.windsurfrules
+opencode.json
+skills-lock.json
+antigravity-skills/
+crush.json
+
+# Explanation / AI-generated docs (keep README.md)
+AGENTS.md
+GEMINI.md
+CLAUDE.md
+MEMORY.md
+PROGRESS.md
+Parameterized.md
+Elevenlabs.md
+KlingO1EditVideo.md
+# KlingO1Reference.md
+day12.md
+image_to_video.md
+image\ editing.md
+text_to_video.md
+txttoimg.md
+mcp-explained.md
+nextflow_audit.md
+openapi-mintlify-explained.md
+phase1_api_and_mcp_audit.md
+phase1_ux_code_gaps_audit.md
+phase2_and_phase3_curriculum.md
+realtime.md
+task.md
+template_gallery_design.md
+zod_audit_report.md
+/docs/plans/
+/docs/superpowers/
+/docs/architecture-deep-dive/
+/dist/nodes/configs/*.md
+
+# Test / scratch scripts
+test-api-logic.js
+test-api.ts
+test-fuzzy.ts
+test-max-tokens.ts
+test-service.ts
+test-unkey.ts
+test_wf.ts
+query_run.ts
+patch-openrouter-tokens.ts
+audit.js
