@@ -156,13 +156,15 @@ MCP clients connect to `/api/mcp` using HTTP transport and the same bearer API k
 
 ## Where the project stands
 
-This branch includes changes to the database schema, task payloads, and accounting contract. The application and worker must be released together after migrations and staging verification; updating only one is insufficient.
+The web application and Trigger.dev worker share the database schema, task payloads, and accounting contract. Changes to that contract require a coordinated release of both components.
 
 Local tests cover concurrency, recovery, payload validation, save conflicts, and media boundaries. Live paid-provider execution and hosted worker recovery still need end-to-end verification. Existing dependency advisories and application lint debt remain. Completion callbacks are best-effort, without delivery retries or event filtering; poll execution status for confirmation.
 
 Automatic Vercel deployments are enabled for pushes to `main` in `vercel.json`. Feature branches run CI and remain undeployed. A local commit alone does not deploy; it must reach GitHub. Vercel uses the linked Git repository, Node 24, and Corepack with the pinned pnpm version.
 
-Before the first release of this execution contract, configure the environment variables in `.env.example`, apply migrations, and release the matching Trigger.dev worker. Vercel builds the web application only; it does not migrate the database or deploy background tasks. Keep the PR unmerged until that coordinated release is ready.
+Production Vercel builds apply checked-in migrations with `pnpm db:migrate` before building the application. A migration failure stops the build. Preview and local builds do not run this production migration step. Configure `DIRECT_URL` (or `DATABASE_URL`) for the intended production database, and review migrations for compatibility with the application that is still serving traffic.
+
+Trigger.dev workers are deployed separately. When task code or its execution contract changes, deploy the matching worker from the same release with `pnpm exec trigger deploy --env prod`, then verify a Text-to-Text run before testing paid providers. Required environment variables are listed in `.env.example`; keep app and worker configuration in sync.
 
 ## Ownership
 
