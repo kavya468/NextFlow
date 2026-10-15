@@ -3,204 +3,42 @@ title: "Execute Workflow"
 openapi: "POST /v1/workflows/{id}/execute"
 ---
 
-## Overriding Inputs
+Executes a saved workflow owned by the API-key user. The server validates the graph, captures a revisioned snapshot, and reserves credits before dispatch.
 
-There are two ways to inject dynamic values into a workflow at execution time. Understanding
-which one to use depends on **how your workflow is configured**.
+## Runtime inputs
 
----
+- `inputs` targets internal node IDs, with a map of input field names to values for each node. Fields must satisfy the selected node's contract.
+- `variables` targets exposed inputs using the node label. Text, image, and video passthrough values are exposed automatically; other fields must be enabled by the workflow author. Nonmatching exposed labels are ignored.
+- `idempotencyKey` identifies one execution request. Reuse it with an identical request after a lost response. A conflicting request with the same key is rejected.
 
-### 1. `variables` — Exposed Inputs Only ✨ (Recommended)
-
-Override values for inputs that have been **exposed** in the canvas editor. These are the
-parameters the workflow author marked as user-configurable.
-
-<Warning>
-  `variables` **only works with exposed inputs**. If a node or field is not exposed,
-  the override will be silently ignored. Use `inputs` (below) for non-exposed fields.
-</Warning>
-
-#### How to find exposed inputs
-
-Every node in your workflow has a **label** (visible on the canvas). Exposed inputs are:
-
-1. **Passthrough nodes** (text, image, video, audio) — automatically exposed. The label is the node label itself.
-2. **Explicit fields** — any node where the author toggled specific inputs as "exposed" via the eye icon. The key format is `nodeLabel.fieldName`.
-
-You can discover the exact labels by inspecting the `nodes` array from `GET /v1/workflows/{id}`:
-- The label is found at `node.data.label` (falls back to `node.type` if unset)
-- Exposed field keys are listed in `node.data.exposedInputKeys`
-
-#### Format
+For a text node labeled `Brief`, an exposed override looks like this:
 
 ```json
 {
+  "idempotencyKey": "brief-001",
   "variables": {
-    "<node_label>": {
-      "<field_key>": "<value>"
-    }
+    "Brief": { "text": "Describe the product in two sentences." }
   }
 }
 ```
 
-#### Examples
-
-**Passthrough node** — a text node labeled `"text"` (default label):
+The equivalent node-ID override uses `inputs`:
 
 ```json
 {
-  "variables": {
-    "text": {
-      "text": "A futuristic smartwatch with health monitoring"
-    }
-  }
-}
-```
-
-**Passthrough node** — a text node with a custom label `"Product Brief"`:
-
-```json
-{
-  "variables": {
-    "Product Brief": {
-      "text": "A futuristic smartwatch with health monitoring"
-    }
-  }
-}
-```
-
-**Explicit exposed fields** — an LLM node labeled `"Creative Director"` with `system_prompt` exposed:
-
-```json
-{
-  "variables": {
-    "Creative Director": {
-      "system_prompt": "You are a luxury brand strategist"
-    }
-  }
-}
-```
-
-<Tip>
-  **The key must exactly match the node label.** If your text node's label is `"text"` (the default),
-  use `"text"` — not a custom name you invented. Open the canvas editor to verify node labels.
-</Tip>
-
----
-
-### 2. `inputs` — Low-Level Node ID Override (Any Field)
-
-Override **any** field on **any** node by targeting the internal node ID directly. This works
-regardless of whether the field is exposed or not.
-
-Use this when you need to override non-exposed fields like `model`, `temperature`, or other
-internal configuration that the workflow author didn't explicitly surface.
-
-#### Format
-
-```json
-{
+  "idempotencyKey": "brief-002",
   "inputs": {
-    "<node_id>": {
-      "<field_key>": "<value>"
-    }
+    "YOUR_TEXT_NODE_ID": { "text": "Describe the product in two sentences." }
   }
 }
 ```
 
-#### Example
+Use IDs and labels from `GET /api/v1/workflows/{id}`. Connected upstream outputs replace saved local values. Explicit runtime overrides are then applied: exposed-label overrides first, node-ID overrides last. Overrides do not bypass failed or missing dependencies.
 
-```json
-{
-  "inputs": {
-    "input_text": {
-      "text": "A new smartwatch with health tracking"
-    },
-    "reviewer_llm": {
-      "model": "anthropic/claude-sonnet-4",
-      "system_prompt": "Be extra critical and grade harshly."
-    }
-  }
-}
-```
+## Completion callbacks
 
-<Warning>
-  Node IDs are **internal identifiers** and may change when a workflow is duplicated or
-  re-created. Prefer `variables` for integrations that need to stay stable across workflow edits.
-</Warning>
+An optional `webhook.url` receives a best-effort POST containing `event`, `runId`, `status`, and `outputs`. The destination must pass public-network URL validation. Callbacks are not signed and delivery is not retried. The accepted `webhook.events` field is currently not used for filtering. Recovery settlement does not redeliver callbacks; poll the execution endpoint for the authoritative result.
 
----
+## Response
 
-### 3. `webhook` — Async Completion Notification
-
-Provide a webhook object to receive `POST` notifications when the workflow finishes or fails.
-
-```json
-{
-  "webhook": {
-    "url": "https://your-app.com/api/webhook/nextflow",
-    "events": ["run.completed", "run.failed"]
-  }
-}
-```
-
-**Webhook payload you'll receive:**
-
-```json
-{
-  "event": "run.completed",
-  "runId": "run_abc123",
-  "status": "SUCCESS"
-}
-```
-
----
-
-## Choosing `variables` vs `inputs`
-
-| | `variables` | `inputs` |
-|---|---|---|
-| **Key type** | Node label (human-readable) | Node ID (internal) |
-| **Scope** | Exposed inputs only | Any field on any node |
-| **Stability** | Stable across workflow edits | May break if nodes are recreated |
-| **Best for** | Integrations, templates, end-user APIs | Advanced overrides, debugging |
-
-<Tip>
-  You can use **both** in the same request. `inputs` (node ID overrides) are applied first
-  at the API layer, then `variables` (label-based overrides) are resolved by the orchestrator
-  at runtime.
-</Tip>
-
----
-
-## Full Example
-
-```bash
-curl --request POST \
-  --url https://next-flow-beta.vercel.app/api/v1/workflows/YOUR_WORKFLOW_ID/execute \
-  --header 'Authorization: Bearer nf_YOUR_API_KEY' \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "variables": {
-      "text": {
-        "text": "Explain the future of quantum computing"
-      }
-    },
-    "webhook": {
-      "url": "https://webhook.site/your-unique-id",
-      "events": ["run.completed", "run.failed"]
-    }
-  }'
-```
-
-<ResponseExample>
-```json 200
-{
-  "runId": "run_abc123",
-  "workflowId": "wf_xyz",
-  "scope": "FULL",
-  "nodeCount": 11,
-  "estimatedCredits": 141200
-}
-```
-</ResponseExample>
+The response includes `runId`, `workflowId`, `scope`, `nodeCount`, `estimatedCredits`, and `status`. A full run uses scope `FULL`. `estimatedCredits` is the maximum reserved amount; successful usage is settled later and unresolved provider outcomes retain their hold.

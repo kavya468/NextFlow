@@ -1,3 +1,4 @@
+import { publicFetch, LOCAL_MEDIA_INPUT_OPTIONS } from "../../lib/safe-fetch";
 import { logger, task } from "@trigger.dev/sdk/v3";
 import crypto from "crypto";
 import ffmpeg from "fluent-ffmpeg";
@@ -51,7 +52,8 @@ async function pollAssembly(assemblyUrl: string): Promise<unknown> {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < ASSEMBLY_TIMEOUT_MS) {
-    const response = await fetch(assemblyUrl, {
+    const response = await publicFetch(assemblyUrl, {
+      maxBytes: 1024 * 1024,
       signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
     });
 
@@ -146,7 +148,7 @@ async function ensureMediaStreams(videoPath: string, audioPath: string): Promise
     new Promise<{
       streams?: Array<{ codec_type?: string }>;
     }>((resolve, reject) => {
-      ffmpeg.ffprobe(videoPath, (error, data) => {
+      ffmpeg.ffprobe(videoPath, LOCAL_MEDIA_INPUT_OPTIONS, (error, data) => {
         if (error) {
           reject(new Error(`ffprobe failed for video: ${error.message}`));
           return;
@@ -157,7 +159,7 @@ async function ensureMediaStreams(videoPath: string, audioPath: string): Promise
     new Promise<{
       streams?: Array<{ codec_type?: string }>;
     }>((resolve, reject) => {
-      ffmpeg.ffprobe(audioPath, (error, data) => {
+      ffmpeg.ffprobe(audioPath, LOCAL_MEDIA_INPUT_OPTIONS, (error, data) => {
         if (error) {
           reject(new Error(`ffprobe failed for audio: ${error.message}`));
           return;
@@ -187,7 +189,9 @@ async function mergeAudioWithVideo(
   await new Promise<void>((resolve, reject) => {
     ffmpeg()
       .input(videoPath)
+      .inputOptions(LOCAL_MEDIA_INPUT_OPTIONS)
       .input(audioPath)
+      .inputOptions(LOCAL_MEDIA_INPUT_OPTIONS)
       .outputOptions([
         "-map 0:v:0",
         "-map 1:a:0",
@@ -235,10 +239,10 @@ export const ffmpegMergeAudioVideoTask = task({
       });
 
       const [videoResponse, audioResponse] = await Promise.all([
-        fetch(input.video_url, {
+        publicFetch(input.video_url, {
           signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
         }),
-        fetch(input.audio_url, {
+        publicFetch(input.audio_url, {
           signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
         }),
       ]);

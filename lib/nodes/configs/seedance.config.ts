@@ -17,6 +17,7 @@
 // ============================================================================
 
 import type { NodeConfig } from "../types";
+import { BILLING_LIMITS, estimateNodeReservation, calculateSeedanceCredits } from "../../credits/billing-policy";
 
 export const seedanceConfig: NodeConfig = {
   id: "seedance-1.5",
@@ -24,7 +25,7 @@ export const seedanceConfig: NodeConfig = {
   description: "Text-to-video and image-to-video generation via fal.ai",
   category: "ai",
   icon: "Video",
-  version: "1.0.0",
+  version: "2.0.0",
 
   // ---------------------------------------------------------------------------
   // INPUTS
@@ -47,6 +48,7 @@ export const seedanceConfig: NodeConfig = {
     },
     {
       key: "prompt",
+      validation: { maxLength: BILLING_LIMITS.promptCharacters },
       type: "text",
       label: "Prompt",
       required: true,
@@ -186,6 +188,7 @@ export const seedanceConfig: NodeConfig = {
       key: "seed",
       type: "text",
       label: "Seed Used",
+      optional: true,
     },
   ],
 
@@ -247,16 +250,16 @@ export const seedanceConfig: NodeConfig = {
   ],
 
   // ---------------------------------------------------------------------------
-  // CREDITS — video generation is expensive (~$0.12 per generation)
+  // CREDITS — Maximum reservation; settlement follows the video-token tariff
   // ---------------------------------------------------------------------------
   credits: {
-    estimate: () => 120_000,
-    calculate: (_inputs, response: unknown) => {
+    estimate: () => estimateNodeReservation("seedance-1.5"),
+    calculate: (inputs, response: unknown) => {
       const res = response as Record<string, unknown> | null;
       if (res && typeof res.cost === "number") {
         return Math.ceil(res.cost * 1_000_000);
       }
-      return 120_000;
+      return calculateSeedanceCredits(inputs);
     },
   },
 

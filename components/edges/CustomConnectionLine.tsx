@@ -1,6 +1,7 @@
 "use client";
 
 import { ConnectionLineComponentProps, getBezierPath } from "@xyflow/react";
+import { EDITOR_UI, editorEdgeGlow } from "@/lib/ui-config";
 import { DataTypeColors, getIOTypeForHandle } from "@/lib/theme";
 
 export function CustomConnectionLine({
@@ -13,6 +14,8 @@ export function CustomConnectionLine({
   fromNode,
   fromHandle,
 }: ConnectionLineComponentProps) {
+  // React Flow's live connection coordinates already use measured handle centers.
+  // Only completed edges need the outer-edge correction in DeletableEdge.
   const [edgePath] = getBezierPath({
     sourceX: fromX,
     sourceY: fromY,
@@ -39,9 +42,9 @@ export function CustomConnectionLine({
         fill="none"
         stroke={strokeHex}
         strokeWidth={2}
-        strokeOpacity={0.7}
+        strokeOpacity={EDITOR_UI.edge.strokeOpacity}
         d={edgePath}
-        style={{ filter: `drop-shadow(0 0 4px ${strokeHex}40)` }}
+        style={{ filter: editorEdgeGlow(strokeHex) }}
       />
     </g>
   );

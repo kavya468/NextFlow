@@ -9,7 +9,7 @@ function NewWorkflowInner() {
   const shouldLoadTemplate = searchParams.get("template") === "cinematic-trailer";
 
   return (
-    <BuilderPage loadTemplate={shouldLoadTemplate} />
+    <BuilderPage key={shouldLoadTemplate ? "cinematic-trailer" : "new"} loadTemplate={shouldLoadTemplate} />
   );
 }
 

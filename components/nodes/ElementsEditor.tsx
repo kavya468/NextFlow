@@ -27,6 +27,8 @@
 
 "use client";
 
+import { APP_UI } from "@/lib/ui-config";
+
 import { useRef, useState, useMemo, useCallback } from "react";
 import { Handle, Position } from "@xyflow/react";
 import { useStore } from "@/lib/store";
@@ -220,7 +222,7 @@ export function ElementsEditor({
                 {/* Status indicators */}
                 <span className="text-[8px] text-[var(--text-placeholder)]">
                   {element.frontal_image_url || isFrontalConnected
-                    ? "✓ frontal"
+                    ? APP_UI.frontalImageReady
                     : ""}{" "}
                   {element.reference_image_urls.filter((u) => u).length > 0
                     ? `· ${element.reference_image_urls.filter((u) => u).length} ref`

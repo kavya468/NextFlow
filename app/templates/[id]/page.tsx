@@ -7,6 +7,7 @@ import { ArrowLeft, Flame, Users, Play, Loader2, Upload, X, Image as ImageIcon, 
 import { trpc } from "@/lib/trpc/client";
 import { toast } from "sonner";
 import { useRealtimeRun } from "@trigger.dev/react-hooks";
+import { APP_UI, EDITOR_UI, RUN_UI, dispatchRunStatus, isKnownRequestRejection, isRecord, isTerminalRunStatus } from "@/lib/ui-config";
 
 const CATEGORY_COLORS: Record<string, string> = {
   image: "bg-violet-500/15 text-violet-400 border-violet-500/20",
@@ -36,6 +37,7 @@ export default function TemplateDetailPage() {
   const utils = trpc.useUtils();
   const { data: template, isLoading, error } = trpc.workflow.templateDetail.useQuery({ id });
   const executeMutation = trpc.workflow.executeTemplate.useMutation();
+  const retryDispatchMutation = trpc.workflow.retryDispatch.useMutation();
 
   const [mode, setMode] = useState<"quick-run" | "edit">("quick-run");
   const [formValues, setFormValues] = useState<Record<string, string>>({});
@@ -49,7 +51,7 @@ export default function TemplateDetailPage() {
   const [isCloning, setIsCloning] = useState(false);
 
   // ── Inline Execution State ─────────────────────────────────────────────
-  const [runState, setRunState] = useState<"idle" | "running" | "completed" | "failed">("idle");
+  const [runState, setRunState] = useState<"idle" | "running" | "completed" | "failed" | "partial" | "cancelled">("idle");
   const [runOutput, setRunOutput] = useState<Record<string, Record<string, unknown>> | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
   const [triggerId, setTriggerId] = useState<string | null>(null);
@@ -57,6 +59,26 @@ export default function TemplateDetailPage() {
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
   const [selectedOutputId, setSelectedOutputId] = useState<string | null>(null);
   const outputRef = useRef<HTMLDivElement>(null);
+  const activeRunRef = useRef<string | null>(null);
+  const terminalHandledRef = useRef(false);
+  const startingRef = useRef(false);
+  const pendingRequestRef = useRef<{ workflowId: string; values: Record<string, string>; idempotencyKey: string } | null>(null);
+  const [requestUnconfirmed, setRequestUnconfirmed] = useState(false);
+  const [runStatus, setRunStatus] = useState("PENDING");
+  const [awaitingSettlement, setAwaitingSettlement] = useState(false);
+  const { data: savedRun, error: statusError } = trpc.workflow.status.useQuery(
+    { runId: currentRunId ?? "" },
+    {
+      enabled: !!currentRunId && runState === "running",
+      refetchInterval: query => isTerminalRunStatus(query.state.data?.status ?? "") ? false : RUN_UI.pollIntervalMs,
+      refetchIntervalInBackground: true,
+    },
+  );
+  const { data: tokenData } = trpc.workflow.triggerToken.useQuery(
+    { runId: currentRunId ?? "" },
+    { enabled: !!currentRunId && !!triggerId && !accessToken && runState === "running" },
+  );
+  const realtimeToken = accessToken ?? (tokenData?.triggerId === triggerId ? tokenData.publicAccessToken : null);
 
   // ── Compute leaf node IDs (nodes with no outgoing edges) ──────────────
   const leafNodeIds = useMemo(() => {
@@ -150,163 +172,140 @@ export default function TemplateDetailPage() {
     audio: Music,
   };
 
-  // ── Execute Handler (inline, no redirect) ──────────────────────────────
-  const handleExecute = async () => {
-    if (!template) return;
+  const retainOutputs = useCallback((outputs: Record<string, Record<string, unknown>>) => {
+    const leafOutputs = Object.fromEntries(Object.entries(outputs).filter(([nodeId]) => leafNodeIds.size === 0 || leafNodeIds.has(nodeId)));
+    const visible = Object.keys(leafOutputs).length ? leafOutputs : outputs;
+    if (Object.keys(visible).length) setRunOutput(previous => ({ ...previous, ...visible }));
+  }, [leafNodeIds]);
 
-    setRunState("running");
-    setRunOutput(null);
-    setRunError(null);
+  const applySavedRun = useCallback((run: {
+    id: string; status: string; triggerId?: string | null;
+    nodeRuns: Array<{ nodeId: string; status: string; outputs: unknown; error?: string | null }>;
+  }) => {
+    if (run.id !== activeRunRef.current || terminalHandledRef.current) return;
+    setRunStatus(run.status);
+    if (run.triggerId) setTriggerId(run.triggerId);
+    const outputs: Record<string, Record<string, unknown>> = {};
+    for (const node of run.nodeRuns) {
+      if (node.status === "SUCCESS" && isRecord(node.outputs)) outputs[node.nodeId] = node.outputs;
+    }
+    retainOutputs(outputs);
+    if (!isTerminalRunStatus(run.status)) return;
+    terminalHandledRef.current = true;
+    setAwaitingSettlement(false);
+    setRunState(run.status === "SUCCESS" ? "completed" : run.status === "PARTIAL" ? "partial" : run.status === "CANCELLED" ? "cancelled" : "failed");
+    if (run.status !== "SUCCESS") {
+      const nodeError = run.nodeRuns.find(node => node.error)?.error;
+      const summary = run.status === "PARTIAL" ? RUN_UI.messages.partial : run.status === "CANCELLED" ? RUN_UI.messages.cancelled : RUN_UI.messages.failed;
+      setRunError(previous => nodeError || previous || summary);
+    } else setRunError(null);
+    setTriggerId(null);
+    setAccessToken(null);
+    void utils.credits.getBalance.invalidate();
+    void utils.workflow.history.invalidate();
+  }, [retainOutputs, utils.credits.getBalance, utils.workflow.history]);
 
+  useEffect(() => {
+    if (savedRun) applySavedRun(savedRun);
+  }, [savedRun, applySavedRun]);
+
+  const refreshSavedRun = useCallback(async () => {
+    const runId = activeRunRef.current;
+    if (!runId || terminalHandledRef.current) return;
+    setAwaitingSettlement(true);
     try {
-      const result = await executeMutation.mutateAsync({
-        workflowId: template.id,
-        values: formValues,
-      });
+      applySavedRun(await utils.client.workflow.status.query({ runId }));
+    } catch {
+      // Polling continues; an unavailable status endpoint is not workflow failure.
+    }
+  }, [applySavedRun, utils.client.workflow.status]);
 
-      setCurrentRunId(result.runId);
-      setTriggerId(result.triggerId);
+  const acceptRun = (result: { runId: string; status: string; triggerId?: string; publicAccessToken?: string }) => {
+    activeRunRef.current = result.runId;
+    terminalHandledRef.current = false;
+    pendingRequestRef.current = null;
+    setRequestUnconfirmed(false);
+    setCurrentRunId(result.runId);
+    setTriggerId(result.triggerId ?? null);
+    setAccessToken(result.publicAccessToken ?? null);
+    setRunStatus(dispatchRunStatus(result.status));
+    setAwaitingSettlement(false);
+    setRunState("running");
+    void utils.credits.getBalance.invalidate();
+    if (result.status === "dispatch_unknown") toast.info(RUN_UI.messages.dispatchUnknown);
+  };
 
-      // Use the publicAccessToken from the execution response
-      if (result.publicAccessToken) {
-        setAccessToken(result.publicAccessToken);
-      } else {
-        // Fallback: mint a token via the dedicated endpoint
-        try {
-          const tokenData = await utils.client.workflow.triggerToken.query({
-            runId: result.runId,
-          });
-          setAccessToken(tokenData.publicAccessToken);
-        } catch {
-          // Realtime unavailable — will rely on one-shot DB fetch
-          toast.error("Live updates unavailable");
-        }
-      }
-    } catch (err: any) {
-      setRunState("failed");
-      setRunError(err.message || "Execution failed");
+  const handleExecute = async () => {
+    if (!template || runState === "running" || startingRef.current) return;
+    startingRef.current = true;
+    setRunState("running");
+    setRunError(null);
+    setAwaitingSettlement(false);
+    if (!pendingRequestRef.current) {
+      activeRunRef.current = null;
+      setCurrentRunId(null);
+      setTriggerId(null);
+      setAccessToken(null);
+      setRunOutput(null);
+      setSelectedOutputId(null);
+      pendingRequestRef.current = { workflowId: template.id, values: { ...formValues }, idempotencyKey: crypto.randomUUID() };
+    }
+    try {
+      acceptRun(await executeMutation.mutateAsync(pendingRequestRef.current));
+    } catch (error: unknown) {
+      if (isKnownRequestRejection(error)) pendingRequestRef.current = null;
+      const unconfirmed = !!pendingRequestRef.current;
+      setRequestUnconfirmed(unconfirmed);
+      setRunState("idle");
+      setRunError(unconfirmed ? RUN_UI.messages.requestUnknown : error instanceof Error ? error.message : "Could not start workflow");
+    } finally {
+      startingRef.current = false;
     }
   };
 
-  // ── Realtime Subscription ──────────────────────────────────────────────
-  const { run: realtimeRun } = useRealtimeRun(triggerId ?? "", {
-    accessToken: accessToken ?? "",
-    enabled: !!triggerId && !!accessToken && runState === "running",
+  const retryDispatch = async () => {
+    if (!currentRunId || retryDispatchMutation.isPending) return;
+    try {
+      acceptRun(await retryDispatchMutation.mutateAsync({ runId: currentRunId }));
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : RUN_UI.messages.dispatchUnknown);
+    }
+  };
 
-    onComplete: (completedRun, completedErr) => {
-      const meta = completedRun.metadata as Record<string, unknown> | undefined;
-      const failed = !!completedErr || completedRun.status === "FAILED";
-
-      if (failed) {
-        setRunState("failed");
-        setRunError(
-          (meta?.error as string) ||
-          completedErr?.message ||
-          "Workflow execution failed"
-        );
-      } else {
-        setRunState("completed");
-        const nodeOutputs = meta?.nodeOutputs as Record<string, Record<string, unknown>> | undefined;
-        if (nodeOutputs) {
-          // Filter to leaf nodes only
-          const leafOutputs: Record<string, Record<string, unknown>> = {};
-          for (const [nodeId, output] of Object.entries(nodeOutputs)) {
-            if (leafNodeIds.size === 0 || leafNodeIds.has(nodeId)) {
-              leafOutputs[nodeId] = output;
-            }
-          }
-          setRunOutput(Object.keys(leafOutputs).length > 0 ? leafOutputs : nodeOutputs);
-        }
-      }
-
-      // Clean up subscription state
-      setTriggerId(null);
-      setAccessToken(null);
+  const { run: realtimeRun, error: realtimeError } = useRealtimeRun(triggerId ?? "", {
+    accessToken: realtimeToken ?? "",
+    enabled: !!triggerId && !!realtimeToken && runState === "running",
+    onComplete: completedRun => {
+      if (completedRun.id === triggerId) void refreshSavedRun();
     },
   });
 
-  // ── Fallback: sync live metadata during execution ──────────────────────
   useEffect(() => {
-    if (!realtimeRun || runState !== "running") return;
-
+    if (!realtimeRun || realtimeRun.id !== triggerId || terminalHandledRef.current) return;
     const meta = realtimeRun.metadata as Record<string, unknown> | undefined;
-
-    // Detect terminal state if onComplete didn't fire (race condition safety net)
-    const isTerminal =
-      !!realtimeRun.finishedAt ||
-      (realtimeRun as any).status === "COMPLETED" ||
-      (meta?.runStatus &&
-        ["SUCCESS", "FAILED", "PARTIAL"].includes(meta.runStatus as string));
-
-    if (isTerminal) {
-      const failed =
-        (realtimeRun as any).status === "FAILED" ||
-        meta?.runStatus === "FAILED";
-
-      if (failed) {
-        setRunState("failed");
-        setRunError((meta?.error as string) || "Workflow execution failed");
-      } else {
-        setRunState("completed");
-        const nodeOutputs = meta?.nodeOutputs as Record<string, Record<string, unknown>> | undefined;
-        if (nodeOutputs) {
-          const leafOutputs: Record<string, Record<string, unknown>> = {};
-          for (const [nodeId, output] of Object.entries(nodeOutputs)) {
-            if (leafNodeIds.size === 0 || leafNodeIds.has(nodeId)) {
-              leafOutputs[nodeId] = output;
-            }
-          }
-          setRunOutput(Object.keys(leafOutputs).length > 0 ? leafOutputs : nodeOutputs);
-        }
-      }
-
-      setTriggerId(null);
-      setAccessToken(null);
+    if (isRecord(meta?.nodeOutputs)) {
+      retainOutputs(Object.fromEntries(Object.entries(meta.nodeOutputs).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))));
     }
-  }, [realtimeRun, runState, leafNodeIds]);
+    if (typeof meta?.error === "string") setRunError(meta.error);
+    if (realtimeRun.finishedAt || realtimeRun.status === "COMPLETED" || isTerminalRunStatus(String(meta?.runStatus ?? ""))) void refreshSavedRun();
+  }, [realtimeRun, triggerId, retainOutputs, refreshSavedRun]);
 
-  // ── Safety Net: one-shot DB fetch after completion ─────────────────────
-  // Trigger.dev SSE can deliver COMPLETED before the last metadata flush.
   useEffect(() => {
-    if (runState !== "completed" || !currentRunId) return;
-
-    utils.client.workflow.status
-      .query({ runId: currentRunId })
-      .then((run) => {
-        if (!run?.nodeRuns) return;
-        const outputMap: Record<string, Record<string, unknown>> = {};
-        for (const nr of run.nodeRuns) {
-          if ((nr as any).status === "SUCCESS" && (nr as any).outputs) {
-            const nodeId = (nr as any).nodeId as string;
-            if (leafNodeIds.size === 0 || leafNodeIds.has(nodeId)) {
-              outputMap[nodeId] = (nr as any).outputs as Record<string, unknown>;
-            }
-          }
-        }
-        if (Object.keys(outputMap).length > 0) {
-          setRunOutput(outputMap);
-        }
-      })
-      .catch((err: unknown) => console.warn("Final output fetch failed:", err));
-  }, [runState, currentRunId, leafNodeIds, utils.client.workflow.status]);
-
-  // ── Auto-scroll to output when it appears ──────────────────────────────
-  useEffect(() => {
-    if ((runState === "completed" || runState === "failed" || runState === "running") && outputRef.current) {
-      outputRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    if (runState !== "idle" && outputRef.current) {
+      outputRef.current.scrollIntoView({ behavior: window.matchMedia(EDITOR_UI.reducedMotion).matches ? "instant" : "smooth", block: "nearest" });
     }
-  }, [runState, runOutput]);
+  }, [runState]);
 
-  // ── Reset handler for "Run Again" ─────────────────────────────────────
-  const handleReset = useCallback(() => {
-    setRunState("idle");
-    setRunOutput(null);
-    setRunError(null);
-    setTriggerId(null);
-    setAccessToken(null);
-    setCurrentRunId(null);
-    setSelectedOutputId(null);
-  }, []);
+  const monitoringLabel = runStatus === "DISPATCH_UNKNOWN" ? RUN_UI.labels.dispatchUnknown
+    : runStatus === "CANCEL_REQUESTED" ? RUN_UI.labels.cancelRequested
+    : awaitingSettlement ? RUN_UI.labels.checking
+    : !currentRunId ? RUN_UI.labels.starting
+    : runStatus === "PENDING" ? RUN_UI.labels.pending : RUN_UI.labels.running;
+  const monitoringMessage = statusError ? RUN_UI.messages.statusUnavailable
+    : runStatus === "DISPATCH_UNKNOWN" ? RUN_UI.messages.dispatchUnknown
+    : runStatus === "CANCEL_REQUESTED" ? RUN_UI.messages.cancellationRequested
+    : awaitingSettlement ? RUN_UI.messages.checking
+    : realtimeError ? RUN_UI.messages.liveUnavailable : "Saved run status refreshes automatically.";
 
   // ── Clone & Edit handler ──────────────────────────────────────────────
   const handleCloneAndEdit = async () => {
@@ -550,7 +549,7 @@ export default function TemplateDetailPage() {
 
               {template.exposedInputWarnings && template.exposedInputWarnings.length > 0 && (
                 <div className="mb-4 p-3 bg-amber-500/15 border border-amber-500/20 rounded-lg">
-                  <p className="text-xs font-medium text-amber-400 mb-1">⚠ Duplicate Labels Detected</p>
+                  <p className="text-xs font-medium text-amber-400 mb-1">{APP_UI.templateDuplicateLabels}</p>
                   {template.exposedInputWarnings.map((w, i) => (
                     <p key={i} className="text-[10px] text-amber-400/80 leading-relaxed">{w}</p>
                   ))}
@@ -748,16 +747,16 @@ export default function TemplateDetailPage() {
 
               {/* Run Button */}
               <button
-                onClick={runState === "completed" || runState === "failed" ? () => { handleReset(); handleExecute(); } : handleExecute}
+                onClick={handleExecute}
                 disabled={executeMutation.isPending || runState === "running"}
                 className="w-full flex items-center justify-center gap-2 bg-violet-600 hover:bg-violet-500 disabled:bg-violet-600/50 disabled:cursor-not-allowed text-white text-sm font-medium px-4 py-2.5 rounded-xl transition-colors"
               >
                 {runState === "running" ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Running…
+                    {monitoringLabel}
                   </>
-                ) : runState === "completed" ? (
+                ) : requestUnconfirmed ? RUN_UI.labels.retryRequest : runState !== "idle" ? (
                   <>
                     <RefreshCw className="w-4 h-4" />
                     Run Again
@@ -771,20 +770,26 @@ export default function TemplateDetailPage() {
               </button>
 
               {/* ── Inline Output Section ──────────────────────────────── */}
+              {runState === "running" && runStatus === "DISPATCH_UNKNOWN" && (
+                <button type="button" onClick={retryDispatch} disabled={retryDispatchMutation.isPending}
+                  className="w-full flex items-center justify-center gap-2 border border-[var(--rf-controls-border)] bg-[var(--rf-controls-bg)] text-[var(--text-primary)] text-sm font-medium px-4 py-2.5 rounded-xl mt-3 hover:bg-[var(--toolbar-btn-hover)]">
+                  {retryDispatchMutation.isPending ? RUN_UI.labels.retryingDispatch : RUN_UI.labels.retryDispatch}
+                </button>
+              )}
               <div ref={outputRef}>
                 {/* Running state */}
                 {runState === "running" && (
-                  <div className="mt-4 p-4 bg-violet-500/10 border border-violet-500/20 rounded-xl animate-pulse">
+                  <div className="mt-4 p-4 bg-violet-500/10 border border-violet-500/20 rounded-xl" role="status" aria-live="polite">
                     <div className="flex items-center gap-2 text-violet-400 text-sm">
                       <Loader2 className="w-4 h-4 animate-spin" />
-                      <span>Running workflow…</span>
+                      <span>{monitoringLabel}</span>
                     </div>
-                    <p className="text-[10px] text-violet-400/60 mt-1">This may take a few moments</p>
+                    <p className="text-[10px] text-violet-400/60 mt-1">{monitoringMessage}</p>
                   </div>
                 )}
 
                 {/* Completed — show outputs */}
-                {runState === "completed" && runOutput && (() => {
+                {runOutput && (() => {
                   const outputEntries = Object.entries(runOutput);
                   const hasMultiple = outputEntries.length > 1;
                   // Auto-select first output if none chosen
@@ -934,15 +939,15 @@ export default function TemplateDetailPage() {
                 )}
 
                 {/* Failed state */}
-                {runState === "failed" && (
+                {runError && runState !== "running" && (
                   <div className="mt-4 p-4 bg-red-500/10 border border-red-500/20 rounded-xl">
-                    <p className="text-xs text-red-400 font-medium">Execution failed</p>
+                    <p className="text-xs text-red-400 font-medium">{requestUnconfirmed ? RUN_UI.labels.dispatchUnknown : runState === "partial" ? "Partially completed" : runState === "cancelled" ? "Cancelled" : runState === "failed" ? "Execution failed" : "Could not start"}</p>
                     <p className="text-[10px] text-red-400/70 mt-1">{runError}</p>
                     <button
-                      onClick={handleReset}
+                      onClick={handleExecute}
                       className="text-[10px] text-red-400/60 underline mt-2 hover:text-red-400/80 transition-colors"
                     >
-                      Try again
+                      {requestUnconfirmed ? RUN_UI.labels.retryRequest : "Run again"}
                     </button>
                   </div>
                 )}

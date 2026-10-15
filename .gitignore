@@ -12,6 +12,7 @@
 
 # testing
 /coverage
+/eslint-report.json
 
 # next.js
 /.next/
@@ -29,6 +30,12 @@ new_deliverables
 
 # production
 /build
+/dist/
+
+# TypeScript compiler output beside the authoritative node/router sources
+/lib/nodes/**/*.js
+/lib/nodes/**/*.d.ts
+/server/trpc/**/*.js
 
 # misc
 .DS_Store
@@ -42,6 +49,7 @@ yarn-error.log*
 
 # env files
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -59,7 +67,6 @@ next-env.d.ts
 .gemini/
 .env*.local
 /docs/api-deep-dive
-galaxyai.pdf
 /.agent/skills
 
 # AI Agent Configurations
@@ -82,7 +89,7 @@ PROGRESS.md
 Parameterized.md
 Elevenlabs.md
 KlingO1EditVideo.md
-# KlingO1Reference.md
+\# KlingO1Reference.md
 day12.md
 image_to_video.md
 image\ editing.md
@@ -114,3 +121,7 @@ test_wf.ts
 query_run.ts
 patch-openrouter-tokens.ts
 audit.js
+
+# Local design studies and implementation notes
+/prototypes/
+/NEXTFLOW_IMPROVEMENT_PLAN.md

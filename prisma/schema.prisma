@@ -23,6 +23,7 @@ model Workflow {
   description String?
   nodes       Json     // React Flow nodes state
   edges       Json     // React Flow edges state
+  revision    Int      @default(0)
   userId      String
   user        User     @relation(fields: [userId], references: [id])
   runs        Run[]
@@ -44,6 +45,18 @@ model Run {
   scope       String          // 'FULL', 'PARTIAL', 'SINGLE'
   status      String          // 'PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'PARTIAL'
   inputValues Json?           // Label→value overrides for parameterized execution
+  graphSnapshot Json?        // Executable graph, resolved overrides, provider choices and estimates
+  workflowRevision Int?
+  accountingVersion Int      @default(0) // Legacy rows remain version 0; new runs explicitly use 1
+  reservedCredits Int        @default(0)
+  chargedCredits Int?
+  settledAt DateTime?
+  requestKey String?
+  requestHash String?
+  workerId String?           // Admission claim: a second worker must not repeat provider work
+  recoveryAttempt Int        @default(0)
+  dispatchError String?
+  cancellationRequestedAt DateTime?
   triggerId   String?         // Trigger.dev Run/Execution ID for cancellations
   durationMs  Int?
   completedAt DateTime?       // Set when run reaches a terminal status
@@ -53,6 +66,7 @@ model Run {
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([workflowId])
+  @@unique([userId, requestKey])
 }
 
 model NodeRun {
@@ -66,6 +80,9 @@ model NodeRun {
   outputs      Json?
   error        String?
   providerUsed String?        // e.g. "fal", "ffmpeg", "gemini"
+  taskId       String?
+  endpointId   String?
+  triggerId    String?
   creditsUsed  Int            @default(0)
   durationMs   Int?
   createdAt    DateTime       @default(now())
@@ -80,6 +97,7 @@ model CreditLedger {
   user          User     @relation(fields: [userId], references: [id])
   delta         Int      // Positive = top-up, negative = spend
   reason        String   // e.g. "node:seedream-4.5", "reserve:run", "settle:node", "topup", "refund"
+  operationKey  String?  @unique
   workflowRunId String?
   run           Run?     @relation(fields: [workflowRunId], references: [id])
   nodeRunId     String?

@@ -1,5 +1,6 @@
 import { logger, task } from "@trigger.dev/sdk/v3";
 import { z } from "zod";
+import { BILLING_LIMITS, OPENROUTER_MODELS, canonicalOpenRouterModel, validateLlmBillingInputs } from "../../lib/credits/billing-policy";
 
 const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_TIMEOUT_MS = 30_000;
@@ -7,16 +8,12 @@ const DEFAULT_MODEL = "google/gemini-2.5-flash";
 
 const openRouterInputSchema = z.object({
   model: z
-    .enum([
-      "google/gemini-2.5-flash",
-      "anthropic/claude-sonnet-4-5",
-      "meta-llama/llama-3-8b-instruct",
-    ])
+    .enum(OPENROUTER_MODELS)
     .default(DEFAULT_MODEL),
   system_prompt: z.string().optional(),
   user_message: z.string().trim().min(1, "User Message is required"),
   images: z.array(z.string()).optional(),
-  max_tokens: z.number().int().min(1).max(8192).default(512),
+  max_tokens: z.number().int().min(1).max(BILLING_LIMITS.outputTokens).default(512),
   temperature: z.number().min(0).max(2).default(0.7),
 });
 
@@ -120,7 +117,8 @@ export const openrouterGenerateTask = task({
       throw new Error(`OpenRouter input validation failed: ${issues}`);
     }
 
-    const input = inputResult.data;
+    const input = { ...inputResult.data, model: canonicalOpenRouterModel(inputResult.data.model) };
+    validateLlmBillingInputs("openrouter-llm", input);
     const apiKey = process.env.OPENROUTER_API_KEY;
     const sanitizedImages = (input.images ?? []).filter(
       (image): image is string => typeof image === "string" && image.trim() !== ""

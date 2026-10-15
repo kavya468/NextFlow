@@ -1,3 +1,4 @@
+import { publicFetch, LOCAL_MEDIA_INPUT_OPTIONS } from "../../lib/safe-fetch";
 import { logger, task } from "@trigger.dev/sdk/v3";
 import crypto from "crypto";
 import ffmpeg from "fluent-ffmpeg";
@@ -91,7 +92,8 @@ async function pollAssembly(assemblyUrl: string): Promise<unknown> {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < ASSEMBLY_TIMEOUT_MS) {
-    const response = await fetch(assemblyUrl, {
+    const response = await publicFetch(assemblyUrl, {
+      maxBytes: 1024 * 1024,
       signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
     });
 
@@ -185,7 +187,7 @@ async function uploadVideoToTransloadit(filePath: string, filename: string): Pro
 
 async function probeVideo(filePath: string): Promise<VideoInfo> {
   const metadata = await new Promise<ProbeData>((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (error, data) => {
+    ffmpeg.ffprobe(filePath, LOCAL_MEDIA_INPUT_OPTIONS, (error, data) => {
       if (error) {
         reject(new Error(`ffprobe failed: ${error.message}`));
         return;
@@ -235,7 +237,7 @@ function parseFrameRate(value?: string): number {
 }
 
 async function downloadVideo(url: string, filePath: string): Promise<void> {
-  const response = await fetch(url, {
+  const response = await publicFetch(url, {
     signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
   });
 
@@ -262,7 +264,7 @@ async function mergeVideos(
 
     // Only add the actual video files as inputs — no lavfi inputs
     for (const inputPath of inputPaths) {
-      command.input(inputPath);
+      command.input(inputPath).inputOptions(LOCAL_MEDIA_INPUT_OPTIONS);
     }
 
     const filters: string[] = [];

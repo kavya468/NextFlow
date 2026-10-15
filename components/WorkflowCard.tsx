@@ -12,6 +12,7 @@ import {
   Globe,
   GlobeLock,
 } from "lucide-react";
+import { APP_UI, EDITOR_UI } from "@/lib/ui-config";
 import { timeAgo } from "@/lib/timeAgo";
 import { trpc } from "@/lib/trpc/client";
 import { PublishDialog } from "@/components/PublishDialog";
@@ -21,9 +22,10 @@ import { toast } from "sonner";
 interface WorkflowCardProps {
   workflow: {
     id: string;
+    revision: number;
     name: string;
     updatedAt: string | Date;
-    nodes: any[] | null;
+    nodes: unknown[] | null;
     visibility?: string;
     description?: string | null;
   };
@@ -35,6 +37,9 @@ export function WorkflowCard({ workflow, tint }: WorkflowCardProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
   const [name, setName] = useState(workflow.name);
+  const [revision, setRevision] = useState(workflow.revision);
+  const [renameError, setRenameError] = useState(false);
+  const renamePendingRef = useRef(false);
   const [isLoading, setIsLoading] = useState(false);
   const [showDeleteToast, setShowDeleteToast] = useState(false);
   const [showPublishDialog, setShowPublishDialog] = useState(false);
@@ -70,18 +75,24 @@ export function WorkflowCard({ workflow, tint }: WorkflowCardProps) {
   }, [isRenaming]);
 
   const handleRename = async () => {
+    if (renamePendingRef.current) return;
     setIsRenaming(false);
     const trimmed = name.trim() || "Untitled";
     setName(trimmed);
     if (trimmed === workflow.name) return;
 
+    renamePendingRef.current = true;
     setIsLoading(true);
     try {
-      await renameMutation.mutateAsync({ id: workflow.id, name: trimmed });
+      const result = await renameMutation.mutateAsync({ id: workflow.id, expectedRevision: revision, name: trimmed });
+      setRevision(result.workflow.revision);
+      setRenameError(false);
       router.refresh();
-    } catch {
-      setName(workflow.name); // revert
+    } catch (error) {
+      setRenameError(true);
+      toast.error(error instanceof Error ? error.message : EDITOR_UI.save.renameError);
     } finally {
+      renamePendingRef.current = false;
       setIsLoading(false);
     }
   };
@@ -172,6 +183,9 @@ export function WorkflowCard({ workflow, tint }: WorkflowCardProps) {
         {/* 3-dot menu button */}
         <div ref={menuRef} className="absolute top-2 right-2 z-10">
           <button
+            type="button"
+            aria-label={APP_UI.dashboard.workflowActions(workflow.name)}
+            aria-expanded={menuOpen}
             onClick={(e) => {
               e.preventDefault();
               e.stopPropagation();
@@ -258,6 +272,10 @@ export function WorkflowCard({ workflow, tint }: WorkflowCardProps) {
         {isRenaming ? (
           <input
             ref={renameRef}
+            aria-label={EDITOR_UI.save.draftTitle}
+            name="workflowName"
+            autoComplete="off"
+            maxLength={100}
             value={name}
             onChange={(e) => setName(e.target.value)}
             onBlur={handleRename}
@@ -276,6 +294,10 @@ export function WorkflowCard({ workflow, tint }: WorkflowCardProps) {
             {name}
           </p>
         )}
+        {renameError && <div className="editor-rename-recovery" role="status">
+          <p>{EDITOR_UI.save.renameError}</p>
+          <button type="button" onClick={() => { setName(workflow.name); setRenameError(false); router.refresh(); }}>{EDITOR_UI.save.reloadTitle}</button>
+        </div>}
         <div className="flex items-center gap-2 mt-0.5">
           <p className="text-xs text-[var(--text-secondary)]" suppressHydrationWarning>
             Edited {timeAgo(workflow.updatedAt)}

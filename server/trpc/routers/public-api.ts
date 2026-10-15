@@ -4,6 +4,8 @@ import { appRouter } from "../root";
 import { TRPCError } from "@trpc/server";
 import { getExposedInputs } from "../../../lib/nodes/exposed-inputs";
 import { nodeRegistry } from "../../../lib/nodes/registry";
+import { executeWorkflow } from "../../../lib/services/workflow-service";
+import { translateServiceError } from "./workflow";
 export const publicApiRouter = createPublicApiRouter({
   listWorkflows: publicApiProcedure
     .meta({
@@ -53,6 +55,9 @@ export const publicApiRouter = createPublicApiRouter({
     .input(
       z.object({
         id: z.string(),
+        idempotencyKey: z.string().min(1).max(128).optional().describe(
+          "Reuse this key when retrying the same execution request to avoid creating another run."
+        ),
         inputs: z
           .record(z.string(), z.record(z.string(), z.any()))
           .optional()
@@ -75,7 +80,7 @@ export const publicApiRouter = createPublicApiRouter({
         ),
       })
     )
-    .output(z.object({ runId: z.string(), workflowId: z.string(), scope: z.string(), nodeCount: z.number(), estimatedCredits: z.number() }))
+    .output(z.object({ runId: z.string(), workflowId: z.string(), scope: z.string(), nodeCount: z.number(), estimatedCredits: z.number(), status: z.string().optional() }))
     .mutation(async ({ ctx, input }) => {
       const caller = appRouter.createCaller({ auth: { userId: ctx.apiUserId } as any, prisma: ctx.prisma, req: ctx.req });
       
@@ -135,22 +140,24 @@ export const publicApiRouter = createPublicApiRouter({
 
       console.log("[API] Runtime overrides prepared:", Object.keys(inputValues));
 
-      const res = await caller.workflow.execute({
-        workflowId: workflow.id,
-        // We pass the ORIGINAL nodes from the DB. 
-        // The orchestrator will apply inputValues at runtime.
-        nodes: nodes, 
-        edges: workflow.edges as any,
-        inputValues: Object.keys(inputValues).length > 0 ? inputValues : undefined,
-        webhookUrl: input.webhook?.url,
-      });
-      return {
-        runId: res.runId,
-        workflowId: res.workflowId,
-        scope: res.scope,
-        nodeCount: res.nodeCount,
-        estimatedCredits: res.estimatedCredits,
-      };
+      try {
+        const res = await executeWorkflow(ctx.apiUserId, workflow.id, {
+          inputValues: Object.keys(inputValues).length > 0 ? inputValues : undefined,
+          webhookUrl: input.webhook?.url,
+          requestKey: input.idempotencyKey,
+          saveCanvas: false,
+        });
+        return {
+          runId: res.executionId,
+          workflowId: workflow.id,
+          scope: res.scope,
+          nodeCount: res.nodeCount,
+          estimatedCredits: res.estimatedCredits,
+          status: res.status,
+        };
+      } catch (error) {
+        translateServiceError(error);
+      }
     }),
 
   executeSelected: publicApiProcedure
@@ -168,6 +175,9 @@ export const publicApiRouter = createPublicApiRouter({
     .input(
       z.object({
         id: z.string(),
+        idempotencyKey: z.string().min(1).max(128).optional().describe(
+          "Reuse this key when retrying the same execution request to avoid creating another run."
+        ),
         selectedNodeIds: z.array(z.string()).meta({
           description: "Array of Node IDs to execute.",
           examples: [["node_4", "node_5"]],
@@ -194,7 +204,7 @@ export const publicApiRouter = createPublicApiRouter({
         ),
       })
     )
-    .output(z.object({ runId: z.string(), workflowId: z.string(), scope: z.string(), nodeCount: z.number(), estimatedCredits: z.number() }))
+    .output(z.object({ runId: z.string(), workflowId: z.string(), scope: z.string(), nodeCount: z.number(), estimatedCredits: z.number(), status: z.string().optional() }))
     .mutation(async ({ ctx, input }) => {
       const caller = appRouter.createCaller({ auth: { userId: ctx.apiUserId } as any, prisma: ctx.prisma, req: ctx.req });
       
@@ -249,22 +259,25 @@ export const publicApiRouter = createPublicApiRouter({
 
       const inputValues = { ...flattenedOverrides, ...flattenedVariables };
 
-      const res = await caller.workflow.execute({
-        workflowId: workflow.id,
-        nodes: nodes,
-        edges: workflow.edges as any,
-        selectedNodeIds: input.selectedNodeIds,
-        inputValues: Object.keys(inputValues).length > 0 ? inputValues : undefined,
-        webhookUrl: input.webhook?.url,
-      });
-      
-      return {
-        runId: res.runId,
-        workflowId: res.workflowId,
-        scope: res.scope,
-        nodeCount: res.nodeCount,
-        estimatedCredits: res.estimatedCredits,
-      };
+      try {
+        const res = await executeWorkflow(ctx.apiUserId, workflow.id, {
+          selectedNodeIds: input.selectedNodeIds,
+          inputValues: Object.keys(inputValues).length > 0 ? inputValues : undefined,
+          webhookUrl: input.webhook?.url,
+          requestKey: input.idempotencyKey,
+          saveCanvas: false,
+        });
+        return {
+          runId: res.executionId,
+          workflowId: workflow.id,
+          scope: res.scope,
+          nodeCount: res.nodeCount,
+          estimatedCredits: res.estimatedCredits,
+          status: res.status,
+        };
+      } catch (error) {
+        translateServiceError(error);
+      }
     }),
 
   getExecution: publicApiProcedure
@@ -283,16 +296,12 @@ export const publicApiRouter = createPublicApiRouter({
       const caller = appRouter.createCaller({ auth: { userId: ctx.apiUserId } as any, prisma: ctx.prisma, req: ctx.req });
       const status = await caller.workflow.status({ runId: input.id });
       
-      const createdAt = new Date((status as any).createdAt).getTime();
-      const finishedAt = (status as any).finishedAt ? new Date((status as any).finishedAt).getTime() : undefined;
-      const durationMs = finishedAt ? finishedAt - createdAt : undefined;
-      
       return {
         id: status.id,
         status: status.status,
         scope: status.scope,
         nodeRuns: status.nodeRuns,
-        durationMs,
+        durationMs: status.durationMs ?? undefined,
       };
     }),
 

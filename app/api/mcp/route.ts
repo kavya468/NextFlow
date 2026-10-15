@@ -130,9 +130,10 @@ const handler = createMcpHandler(
           workflowName: z.string().min(1).describe("The exact name of the saved workflow to execute."),
           workflowId: z.string().optional().describe("Optional workflow ID. If omitted, resolved automatically from workflowName."),
           input: z.record(z.string(), z.unknown()).optional().describe("Optional input overrides for parameterized workflows (key-value pairs)."),
+          idempotencyKey: z.string().min(1).max(128).optional().describe("Reuse this key when retrying the same execution request to avoid creating another run."),
         },
       },
-      async ({ workflowName, workflowId, input }, extra) => {
+      async ({ workflowName, workflowId, input, idempotencyKey }, extra) => {
         try {
           const userId = getUserId(extra);
 
@@ -145,6 +146,8 @@ const handler = createMcpHandler(
 
           const result = await executeWorkflow(userId, resolvedId, {
             inputValues: input,
+            requestKey: idempotencyKey,
+            saveCanvas: false,
           });
           return ok(result);
         } catch (err) {

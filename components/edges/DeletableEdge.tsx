@@ -1,6 +1,8 @@
 "use client";
 
-import { BaseEdge, EdgeLabelRenderer, getBezierPath } from "@xyflow/react";
+import { BaseEdge, EdgeLabelRenderer, getBezierPath, useInternalNode, type EdgeProps } from "@xyflow/react";
+import { centerEdgeEndpoint } from "@/lib/edge-geometry";
+import { EDITOR_UI, editorEdgeGlow } from "@/lib/ui-config";
 import { useStore } from "@/lib/store";
 import { X } from "lucide-react";
 import { DataTypeColors, getIOTypeForHandle } from "@/lib/theme";
@@ -10,6 +12,8 @@ export function DeletableEdge({
   id,
   source,
   sourceHandleId,
+  target,
+  targetHandleId,
   sourceX,
   sourceY,
   targetX,
@@ -19,13 +23,21 @@ export function DeletableEdge({
   style = {},
   markerEnd,
   data,
-}: any) {
+}: EdgeProps) {
+  const sourceInternal = useInternalNode(source);
+  const targetInternal = useInternalNode(target);
+  const sourceHandles = sourceInternal?.internals.handleBounds?.source ?? [];
+  const targetHandles = [...(targetInternal?.internals.handleBounds?.target ?? []), ...(targetInternal?.internals.handleBounds?.source ?? [])];
+  const sourceHandle = sourceHandleId ? sourceHandles.find(handle => handle.id === sourceHandleId) : sourceHandles[0];
+  const targetHandle = targetHandleId ? targetHandles.find(handle => handle.id === targetHandleId) : targetHandles[0];
+  const sourceCenter = centerEdgeEndpoint({ x: sourceX, y: sourceY }, sourcePosition, sourceHandle);
+  const targetCenter = centerEdgeEndpoint({ x: targetX, y: targetY }, targetPosition, targetHandle);
   const [edgePath, labelX, labelY] = getBezierPath({
-    sourceX,
-    sourceY,
+    sourceX: sourceCenter.x,
+    sourceY: sourceCenter.y,
     sourcePosition,
-    targetX,
-    targetY,
+    targetX: targetCenter.x,
+    targetY: targetCenter.y,
     targetPosition,
   });
 
@@ -58,8 +70,8 @@ export function DeletableEdge({
   const customizedStyle = {
     ...style,
     stroke: strokeHex,
-    strokeOpacity: 0.7,
-    filter: `drop-shadow(0 0 4px ${strokeHex}40)`,
+    strokeOpacity: EDITOR_UI.edge.strokeOpacity,
+    filter: editorEdgeGlow(strokeHex),
   };
 
   return (
@@ -77,9 +89,11 @@ export function DeletableEdge({
           <button
             className="w-5 h-5 flex items-center justify-center bg-[var(--rf-controls-bg)] border border-[var(--rf-controls-border)] rounded-full text-[var(--text-muted)] hover:text-[var(--status-error)] hover:border-[var(--status-error-border)] hover:bg-[var(--btn-danger-hover)] shadow-lg cursor-pointer transition-colors"
             onClick={onEdgeClick}
-            title="Delete connection"
+            type="button"
+            aria-label={EDITOR_UI.labels.deleteConnection}
+            title={EDITOR_UI.labels.deleteConnection}
           >
-            <X className="w-3 h-3" />
+            <X aria-hidden="true" className="w-3 h-3" />
           </button>
         </div>
       </EdgeLabelRenderer>

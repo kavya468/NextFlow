@@ -128,7 +128,7 @@ export async function addEdge(
 
     await tx.workflow.update({
       where: { id: workflow.id },
-      data: { edges: edges as any },
+      data: { edges: edges as any, revision: { increment: 1 } },
     });
 
     return {
@@ -190,7 +190,7 @@ export async function deleteEdge(
 
     await tx.workflow.update({
       where: { id: workflow.id },
-      data: { edges: edges as any },
+      data: { edges: edges as any, revision: { increment: 1 } },
     });
 
     return {

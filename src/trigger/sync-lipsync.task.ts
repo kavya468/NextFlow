@@ -16,7 +16,7 @@
 
 import { logger, task, wait } from "@trigger.dev/sdk/v3";
 import { z } from "zod";
-import { buildWebhookUrl } from "../../lib/webhook-signing";
+import { buildWebhookUrl, assertFalRequestId } from "../../lib/webhook-signing";
 
 // ── fal.ai API configuration ────────────────────────────────────────────────
 
@@ -39,13 +39,13 @@ const taskInputSchema = z.object({
 });
 
 const falQueueResponseSchema = z.object({
-  request_id: z.string(),
+  request_id: z.string().min(1),
   status: z.string().optional(),
   queue_position: z.number().optional(),
 });
 
 const falWebhookSuccessSchema = z.object({
-  request_id: z.string(),
+  request_id: z.string().min(1),
   status: z.literal("OK"),
   payload: z.object({
     video: z.object({
@@ -58,7 +58,7 @@ const falWebhookSuccessSchema = z.object({
 });
 
 const falWebhookErrorSchema = z.object({
-  request_id: z.string(),
+  request_id: z.string().min(1),
   status: z.literal("ERROR"),
   error: z.string(),
 });
@@ -180,6 +180,7 @@ export const syncLipsyncTask = task({
     }
 
     const queueResult = falQueueResponseSchema.safeParse(queueData);
+    if (!queueResult.success) throw new Error("Provider queue response has no valid request ID");
     if (!queueResult.success) {
       logger.warn("fal.ai queue response has unexpected shape", {
         raw: JSON.stringify(queueData).slice(0, 500),
@@ -207,6 +208,7 @@ export const syncLipsyncTask = task({
     }
 
     const webhookPayload = waitResult.output;
+    assertFalRequestId(webhookPayload, queueResult.data.request_id);
 
     logger.info("Webhook payload received", {
       status: (webhookPayload as Record<string, unknown>)?.status,

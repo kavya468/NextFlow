@@ -28,9 +28,11 @@
 //   { audio_url: string, seed: number }
 // ============================================================================
 
-import { logger, task, wait } from "@trigger.dev/sdk/v3";
+import { logger, task, wait } from "@trigger.dev/sdk";
 import { z } from "zod";
-import { buildWebhookUrl } from "../../lib/webhook-signing";
+import { buildWebhookUrl, assertFalRequestId } from "../../lib/webhook-signing";
+import { validateDialogueBillingInputs } from "../../lib/credits/billing-policy";
+import { composeDialogueInputs } from "../../lib/nodes/structured-inputs";
 
 const FAL_BASE_URL = "https://queue.fal.run";
 const FAL_ENDPOINT = "fal-ai/elevenlabs/text-to-dialogue/eleven-v3";
@@ -54,14 +56,7 @@ const pronunciationDictionaryLocatorSchema = z.object({
 //   - Array of {text, voice} blocks (from UI dialogue editor)
 //   - A raw string (from upstream LLM/Text nodes — smart-parsed at runtime)
 const taskInputSchema = z.object({
-  inputs: z
-    .union([
-      z.array(dialogueBlockSchema).min(1, "At least one input block is required"),
-      z.string().min(1, "Input text is required"),
-    ])
-    .transform((val) =>
-      typeof val === "string" ? parseInputsString(val) : val,
-    ),
+  inputs: z.array(dialogueBlockSchema).min(1, "At least one input block is required"),
   stability: z.number().min(0).max(1).optional(),
   use_speaker_boost: z.boolean().optional(),
   language_code: z.string().optional(),
@@ -71,14 +66,14 @@ const taskInputSchema = z.object({
 
 // fal.ai queue response shape
 const falQueueResponseSchema = z.object({
-  request_id: z.string(),
+  request_id: z.string().min(1),
   status: z.string().optional(),
   queue_position: z.number().optional(),
 });
 
 // Webhook success payload — fal.ai wraps the output in `payload`
 const falWebhookSuccessSchema = z.object({
-  request_id: z.string(),
+  request_id: z.string().min(1),
   status: z.literal("OK"),
   payload: z.object({
     audio: z.object({
@@ -93,124 +88,10 @@ const falWebhookSuccessSchema = z.object({
 });
 
 const falWebhookErrorSchema = z.object({
-  request_id: z.string(),
+  request_id: z.string().min(1),
   status: z.literal("ERROR"),
   error: z.string(),
 });
-
-// ── Smart Input Parser ──────────────────────────────────────────────────────
-// Converts various string formats into the required [{text, voice}] array.
-//
-// SUPPORTED FORMATS (in order of detection):
-//
-// 1. JSON Array (already correct):
-//    [{"text": "Hello!", "voice": "Rachel"}, {"text": "Hi!", "voice": "Adam"}]
-//
-// 2. "Speaker: dialogue" lines (colon-separated):
-//    Rachel: Hello, how are you?
-//    Adam: I'm doing great, thanks!
-//
-// 3. "SPEAKER\ndialogue" blocks (name on its own line, dialogue below):
-//    Rachel
-//    Hello, how are you?
-//
-//    Adam
-//    I'm doing great, thanks!
-//
-// 4. Plain text (fallback — assigned to "default" voice):
-//    Hello, this is a simple text to speak.
-//
-// The default voice name "default" tells the API to use ElevenLabs' default.
-// Users can override this later in the UI or by connecting to dialogue handles.
-
-const DEFAULT_VOICE = "default";
-
-function parseInputsString(
-  raw: string
-): { text: string; voice: string }[] {
-  const trimmed = raw.trim();
-  if (!trimmed) return [];
-
-  // ── Strategy 1: Try JSON parse ──────────────────────────────────────────
-  if (trimmed.startsWith("[")) {
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (
-        Array.isArray(parsed) &&
-        parsed.length > 0 &&
-        parsed.every(
-          (item: any) =>
-            typeof item === "object" &&
-            item !== null &&
-            typeof item.text === "string" &&
-            typeof item.voice === "string"
-        )
-      ) {
-        return parsed as { text: string; voice: string }[];
-      }
-    } catch {
-      // Not valid JSON — fall through to text parsing
-    }
-  }
-
-  // ── Strategy 2: "Speaker: dialogue" lines ───────────────────────────────
-  // Matches lines like "Rachel: Hello there!" or "Adam: How are you?"
-  // A speaker name is 1-40 chars of letters, spaces, hyphens, or underscores
-  const colonLineRegex = /^([A-Za-z][A-Za-z0-9 _-]{0,39}):\s*(.+)$/;
-  const lines = trimmed.split("\n").map((l) => l.trim()).filter(Boolean);
-  const colonMatches = lines
-    .map((line) => colonLineRegex.exec(line))
-    .filter((m): m is RegExpExecArray => m !== null);
-
-  // If at least half the non-empty lines match "Speaker: text", use this strategy
-  if (colonMatches.length > 0 && colonMatches.length >= lines.length * 0.5) {
-    return colonMatches.map((m) => ({
-      text: m[2].trim(),
-      voice: m[1].trim(),
-    }));
-  }
-
-  // ── Strategy 3: "SPEAKER\ndialogue" blocks (separated by blank lines) ──
-  // Split on double newlines to get blocks. Each block's first line is the
-  // speaker name, remaining lines are the dialogue text.
-  const blocks = trimmed.split(/\n\s*\n/).filter(Boolean);
-  if (blocks.length >= 2) {
-    const nameOnlyRegex = /^[A-Za-z][A-Za-z0-9 _-]{0,39}$/;
-    const blockResults: { text: string; voice: string }[] = [];
-    let allBlocksMatch = true;
-
-    for (const block of blocks) {
-      const blockLines = block.split("\n").map((l) => l.trim()).filter(Boolean);
-      if (blockLines.length >= 2 && nameOnlyRegex.test(blockLines[0])) {
-        blockResults.push({
-          voice: blockLines[0],
-          text: blockLines.slice(1).join(" ").trim(),
-        });
-      } else {
-        allBlocksMatch = false;
-        break;
-      }
-    }
-
-    if (allBlocksMatch && blockResults.length > 0) {
-      return blockResults;
-    }
-  }
-
-  // ── Strategy 4: Plain text fallback ─────────────────────────────────────
-  // Treat each non-empty line as a separate dialogue entry with "default" voice.
-  // If it's a single block of text, return it as one entry.
-  const nonEmptyLines = trimmed.split("\n").map((l) => l.trim()).filter(Boolean);
-  if (nonEmptyLines.length === 1) {
-    return [{ text: nonEmptyLines[0], voice: DEFAULT_VOICE }];
-  }
-
-  // Multiple lines without speaker attribution → each line is one entry
-  return nonEmptyLines.map((line) => ({
-    text: line,
-    voice: DEFAULT_VOICE,
-  }));
-}
 
 // ── Task definition ─────────────────────────────────────────────────────────
 
@@ -237,56 +118,8 @@ export const elevenlabsTask = task({
       inputType: typeof payload.inputs,
     });
 
-    // 1. Smart-parse inputs from various formats
-    let parsedPayload = {
-      ...payload,
-      inputs: Array.isArray(payload.inputs) ? payload.inputs : undefined
-    } as any;
-
-    if (typeof payload.inputs === 'string') {
-      // ── Smart string parsing ────────────────────────────────────────────
-      // Upstream nodes (LLMs, Text nodes) may send a plain string.
-      // Parse it into the required [{text, voice}] array format.
-      const parsed = parseInputsString(payload.inputs);
-      if (parsed.length === 0) {
-        throw new Error(
-          "Failed to parse inputs string. The input was empty or could not be " +
-          "converted to dialogue blocks. See the supported formats:\n" +
-          '  • JSON: [{"text": "Hello", "voice": "Rachel"}]\n' +
-          "  • Script: Rachel: Hello there!\n" +
-          "  • Plain text: Hello there! (uses default voice)"
-        );
-      }
-      parsedPayload.inputs = parsed;
-      logger.info("Smart-parsed string inputs into dialogue blocks", {
-        blockCount: parsed.length,
-        voices: [...new Set(parsed.map((b) => b.voice))],
-      });
-    }
-
-    // ── Merge dynamic dialogue_text_X handles ────────────────────────────
-    // When users connect Text nodes to individual dialogue line handles
-    // (dialogue_text_0, dialogue_text_1, ...), the orchestrator injects
-    // these values into the payload. Here we merge them into the parsed
-    // inputs array, overriding the manual text for each connected line.
-    if (Array.isArray(parsedPayload.inputs)) {
-      for (const key of Object.keys(payload)) {
-        const match = key.match(/^dialogue_text_(\d+)$/);
-        if (match && payload[key] !== undefined && payload[key] !== null && payload[key] !== "") {
-          const index = parseInt(match[1], 10);
-          if (index < parsedPayload.inputs.length) {
-            parsedPayload.inputs[index] = {
-              ...parsedPayload.inputs[index],
-              text: String(payload[key]),
-            };
-            logger.info(`Merged connected text for dialogue line ${index}`, {
-              handleKey: key,
-              textLength: String(payload[key]).length,
-            });
-          }
-        }
-      }
-    }
+    // Use the same composition rules as the worker before provider admission.
+    const parsedPayload = { ...payload, inputs: composeDialogueInputs(payload) };
 
     const inputResult = taskInputSchema.safeParse(parsedPayload);
     if (!inputResult.success) {
@@ -297,6 +130,7 @@ export const elevenlabsTask = task({
       throw new Error(`ElevenLabs input validation failed: ${issues}`);
     }
     const input = inputResult.data;
+    validateDialogueBillingInputs({ inputs: input.inputs });
 
     logger.info("Parsed dialogue blocks", {
       count: input.inputs.length,
@@ -424,6 +258,7 @@ export const elevenlabsTask = task({
     }
 
     const queueResult = falQueueResponseSchema.safeParse(queueData);
+    if (!queueResult.success) throw new Error("Provider queue response has no valid request ID");
     if (queueResult.success) {
       logger.info("Job queued successfully", {
         requestId: queueResult.data.request_id,
@@ -449,6 +284,7 @@ export const elevenlabsTask = task({
     }
 
     const webhookPayload = waitResult.output;
+    assertFalRequestId(webhookPayload, queueResult.data.request_id);
     logger.info("Webhook payload received", {
       status: (webhookPayload as Record<string, unknown>)?.status,
     });
@@ -491,6 +327,7 @@ export const elevenlabsTask = task({
     return {
       audio_url: audioUrl,
       seed: successResult.data.payload.seed,
+      billableCharacters: input.inputs.reduce((sum, line) => sum + Array.from(line.text).length, 0),
     };
   },
 });

@@ -3,22 +3,29 @@
 import { Coins } from "lucide-react";
 import { trpc } from "@/lib/trpc/client";
 import { useState } from "react";
+import { RUN_UI } from "@/lib/ui-config";
 import { CreditHistoryDrawer } from "./CreditHistoryDrawer";
 
 export function CreditBadge() {
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const { data, isLoading } = trpc.credits.getBalance.useQuery(undefined, {
+  const { data, isLoading, isError } = trpc.credits.getBalance.useQuery(undefined, {
     staleTime: 30_000,
     refetchInterval: 30_000,
   });
 
   const balance = data?.balance ?? 0;
-  const isLow = balance < 100_000;
-  const isCritical = balance < 10_000;
+  const isLow = !isLoading && !isError && balance < 100_000;
+  const isCritical = !isLoading && !isError && balance < 10_000;
+  const accessibleLabel = isLoading ? RUN_UI.labels.balanceLoading : isError ? RUN_UI.labels.balanceUnavailable : RUN_UI.creditBalance(balance.toLocaleString());
 
   return (
     <>
       <button
+        type="button"
+        aria-label={accessibleLabel}
+        title={accessibleLabel}
+        aria-haspopup="dialog"
+        aria-expanded={drawerOpen}
         onClick={() => setDrawerOpen(true)}
         className={`
           relative flex items-center gap-1.5 rounded-lg px-2.5 py-1.5
@@ -31,9 +38,9 @@ export function CreditBadge() {
           }
         `}
       >
-        <Coins className="w-3.5 h-3.5 shrink-0 opacity-70" />
+        <Coins aria-hidden="true" className="w-3.5 h-3.5 shrink-0 opacity-70" />
         <span className="font-mono tabular-nums tracking-tight">
-          {isLoading ? "..." : balance.toLocaleString("en-US")}
+          {isLoading ? "…" : isError ? "—" : balance.toLocaleString()}
         </span>
         {isLow && !isCritical && (
           <span className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-[var(--status-warning)]" />

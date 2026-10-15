@@ -7,7 +7,7 @@ export const klingConfig: NodeConfig = {
     "Video-to-video generation and editing via fal.ai Kling O1 model",
   category: "ai",
   icon: "Clapperboard",
-  version: "1.0.0",
+  version: "2.0.0",
 
   inputs: [
     {

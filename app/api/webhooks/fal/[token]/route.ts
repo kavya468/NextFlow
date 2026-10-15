@@ -1,85 +1,30 @@
-// ============================================================================
-// app/api/webhooks/fal/[token]/route.ts — fal.ai Webhook Receiver
-// ============================================================================
-//
-// fal.ai POSTs here when an async generation job completes.
-// This route delivers the payload to the paused Trigger.dev task via
-// wait.completeToken(), then returns 200 immediately.
-//
-// SECURITY:
-//   - HMAC-SHA256 signature verification on the token (rejects forged URLs)
-//   - HMAC check happens BEFORE the try/catch that swallows delivery errors
-//
-// RESPONSE CONTRACT:
-//   - 401 if HMAC verification fails
-//   - 400 if request body is not valid JSON
-//   - 200 for everything else (even if token delivery fails)
-//
-// TIMING:
-//   Must respond within 3 seconds. No Prisma writes, no blocking operations.
-//   Token delivery is fire-and-forget with error swallowing.
-// ============================================================================
-
-import { NextRequest, NextResponse } from "next/server";
-import { wait } from "@trigger.dev/sdk/v3";
+import { NextRequest } from "next/server";
+import { wait } from "@trigger.dev/sdk";
+import { z } from "zod";
 import { verifyWebhookSignature } from "@/lib/webhook-signing";
+import { verifyFalWebhook } from "@/lib/fal-webhook";
+import { readBoundedBody, RequestBodyError } from "@/lib/request-body";
 
-export async function POST(
-  req: NextRequest,
-  { params }: { params: Promise<{ token: string }> }
-) {
-  const resolvedParams = await params;
-  const token = decodeURIComponent(resolvedParams.token);
-  const sig = req.nextUrl.searchParams.get("sig");
+const callbackSchema = z.object({ request_id: z.string().min(1), status: z.enum(["OK", "ERROR"]) }).passthrough();
 
-  // ── 1. HMAC verification — BEFORE any error-swallowing try/catch ──────
-  if (!verifyWebhookSignature(token, sig)) {
-    console.error("[webhook/fal] HMAC verification failed", {
-      token: token.slice(0, 20) + "...",
-      sigPresent: !!sig,
-    });
-    return NextResponse.json(
-      { error: "Invalid signature" },
-      { status: 401 }
-    );
+export async function POST(req: NextRequest, { params }: { params: Promise<{ token: string }> }) {
+  const { token } = await params;
+  if (!verifyWebhookSignature(token, req.nextUrl.searchParams.get("sig"))) {
+    return Response.json({ error: "Invalid signature" }, { status: 401 });
   }
-
-  // ── 2. Parse request body ─────────────────────────────────────────────
-  let body: unknown;
   try {
-    body = await req.json();
-  } catch {
-    console.error("[webhook/fal] Failed to parse JSON body", {
-      token: token.slice(0, 20) + "...",
-    });
-    return NextResponse.json(
-      { error: "Invalid JSON body" },
-      { status: 400 }
-    );
+    const rawBody = await readBoundedBody(req, 2 * 1024 * 1024);
+    if (!(await verifyFalWebhook(req.headers, rawBody))) {
+      return Response.json({ error: "Invalid provider signature" }, { status: 401 });
+    }
+    const parsed = callbackSchema.safeParse(JSON.parse(rawBody.toString("utf8")));
+    if (!parsed.success) return Response.json({ error: "Invalid callback payload" }, { status: 400 });
+    // Trigger waitpoints accept completion once; failed delivery must remain retryable.
+    await wait.completeToken(token, parsed.data);
+    return Response.json({ received: true });
+  } catch (error) {
+    if (error instanceof RequestBodyError) return Response.json({ error: error.message }, { status: error.status });
+    if (error instanceof SyntaxError) return Response.json({ error: "Invalid JSON body" }, { status: 400 });
+    return Response.json({ error: "Callback delivery temporarily unavailable" }, { status: 503 });
   }
-
-  console.log("[webhook/fal] Received callback", {
-    token: token.slice(0, 20) + "...",
-    hasBody: !!body,
-    status: (body as Record<string, unknown>)?.status,
-  });
-
-  // ── 3. Deliver token to Trigger.dev — errors swallowed ────────────────
-  // If delivery fails (task already timed out, token invalid, network error),
-  // we still return 200 to prevent fal.ai from retrying and causing
-  // duplicate webhook deliveries.
-  try {
-    await wait.completeToken(token, body);
-    console.log("[webhook/fal] Token delivered successfully", {
-      token: token.slice(0, 20) + "...",
-    });
-  } catch (err) {
-    console.error("[webhook/fal] Token delivery failed (non-fatal)", {
-      token: token.slice(0, 20) + "...",
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
-  // ── 4. Always 200 ────────────────────────────────────────────────────
-  return NextResponse.json({ received: true });
 }

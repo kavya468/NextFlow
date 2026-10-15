@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { APP_UI } from "@/lib/ui-config";
 import { Inter } from "next/font/google";
 import "./globals.css";
 import { ClerkProvider } from "@clerk/nextjs";
@@ -15,8 +16,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "NextFlow | Krea LLM Clone",
-  description: "Visual workflow builder for LLMs",
+  title: APP_UI.title,
+  description: APP_UI.description,
 };
 
 export default function RootLayout({

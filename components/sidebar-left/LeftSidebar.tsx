@@ -2,8 +2,9 @@
 
 import { UserButton } from "@clerk/nextjs";
 import { PanelLeftClose, Settings, BookOpen } from "lucide-react";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import Link from "next/link";
+import { APP_UI, EDITOR_UI } from "@/lib/ui-config";
 import { useStore } from "@/lib/store";
 import { nodeRegistry } from "@/lib/nodes/registry";
 import "@/lib/nodes/configs"; // side-effect: registers all configs
@@ -162,6 +163,16 @@ function FallbackIcon(props: React.SVGProps<SVGSVGElement>) {
 export function LeftSidebar() {
   const [isOpen, setIsOpen] = useState(true);
 
+  useEffect(() => {
+    const viewport = window.matchMedia(EDITOR_UI.compactViewport);
+    const collapseOnCompactViewport = () => {
+      if (viewport.matches) setIsOpen(false);
+    };
+    collapseOnCompactViewport();
+    viewport.addEventListener("change", collapseOnCompactViewport);
+    return () => viewport.removeEventListener("change", collapseOnCompactViewport);
+  }, []);
+
   // -------------------------------------------------------------------------
   // Read palette entries from the registry, grouped by category.
   // useMemo ensures we only recompute when the registry changes.
@@ -212,44 +223,27 @@ export function LeftSidebar() {
   };
 
   return (
-    <div className={`flex flex-col h-full border-r border-[var(--sidebar-border)] bg-[var(--sidebar-bg)] transition-all duration-300 ease-in-out ${isOpen ? 'w-64' : 'w-[72px]'}`}>
-      {/* Header */}
-      <div className="flex items-center justify-between p-4 h-[60px]">
-        {isOpen ? (
-          <div className="flex items-center gap-2 overflow-hidden">
-            <div className="w-5 h-5 rounded-[4px] border border-[var(--border-muted)] grid grid-cols-2 gap-[2px] p-[3px] shrink-0">
-              <div className="bg-[var(--text-muted)] rounded-[1px]"></div>
-              <div className="bg-[var(--text-muted)] rounded-[1px]"></div>
-              <div className="bg-[var(--text-muted)] rounded-[1px]"></div>
-              <div className="bg-[var(--text-muted)] rounded-[1px]"></div>
-            </div>
-          </div>
-        ) : (
-          <button
-            onClick={() => setIsOpen(!isOpen)}
-            className="mx-auto grid grid-cols-2 gap-[2px] p-[3px] w-5 h-5 shrink-0"
-          >
-            <div className="bg-[var(--text-muted)] rounded-[1px]"></div>
-            <div className="bg-[var(--text-muted)] rounded-[1px]"></div>
-            <div className="bg-[var(--text-muted)] rounded-[1px]"></div>
-            <div className="bg-[var(--text-muted)] rounded-[1px]"></div>
-          </button>
-        )}
-
-        {isOpen && (
-          <button
-            onClick={() => setIsOpen(!isOpen)}
-            className="p-1.5 rounded-md hover:bg-[var(--sidebar-item-hover)] text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] transition-colors"
-          >
-            <PanelLeftClose className="w-4 h-4" />
-          </button>
-        )}
+    <aside aria-label={EDITOR_UI.labels.palette} className="editor-palette flex flex-col h-full border-r border-[var(--sidebar-border)] bg-[var(--sidebar-bg)]" data-expanded={isOpen}>
+      {/* A stable toggle keeps keyboard focus when the palette collapses. */}
+      <div className="editor-palette-header">
+        {isOpen && <div className="editor-palette-mark" aria-hidden="true"><i /><i /><i /><i /></div>}
+        <button
+          type="button"
+          onClick={() => setIsOpen((open) => !open)}
+          className="editor-icon-button"
+          aria-label={isOpen ? EDITOR_UI.labels.collapsePalette : EDITOR_UI.labels.expandPalette}
+          title={isOpen ? EDITOR_UI.labels.collapsePalette : EDITOR_UI.labels.expandPalette}
+          aria-expanded={isOpen}
+          aria-controls={EDITOR_UI.ids.palette}
+        >
+          {isOpen ? <PanelLeftClose aria-hidden="true" /> : <span className="editor-palette-mark" aria-hidden="true"><i /><i /><i /><i /></span>}
+        </button>
       </div>
 
       {/* ================================================================== */}
       {/* Node Palette — dynamically generated from NodeRegistry              */}
       {/* ================================================================== */}
-      <div className="flex-1 overflow-y-auto p-3 hide-scrollbar pt-4">
+      <div id={EDITOR_UI.ids.palette} className="flex-1 min-h-0 overflow-y-auto p-3 hide-scrollbar pt-4">
         {CATEGORY_ORDER.map((category) => {
           const entries = paletteByCategory[category];
           if (!entries || entries.length === 0) return null;
@@ -270,10 +264,12 @@ export function LeftSidebar() {
                   return (
                     <button
                       key={entry.type}
+                      type="button"
+                      aria-label={`Add ${entry.label} node`}
                       draggable
                       onDragStart={(e) => onDragStart(e, entry.type)}
                       onClick={() => onClickAddNode(entry.type)}
-                      className={`flex items-center gap-3 w-full rounded-lg hover:bg-[var(--sidebar-item-hover)] transition-all text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] cursor-grab active:cursor-grabbing group ${
+                      className={`flex items-center gap-3 w-full rounded-lg hover:bg-[var(--sidebar-item-hover)] transition-colors text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] cursor-grab active:cursor-grabbing group ${
                         !isOpen ? "p-3 justify-center" : "px-3 py-2"
                       }`}
                       title={!isOpen ? entry.label : entry.description}
@@ -296,17 +292,19 @@ export function LeftSidebar() {
       {/* ================================================================== */}
       {/* Sticky Note — visual-only annotation node (not in registry)       */}
       {/* ================================================================== */}
-      <div className="px-3 pb-3">
+      <div className="editor-palette-annotation shrink-0 px-3 pb-3">
         {isOpen && (
           <h3 className="text-[10px] font-semibold uppercase tracking-wider text-[var(--text-placeholder)] mb-2 ml-3">
             Annotate
           </h3>
         )}
         <button
+          type="button"
+          aria-label={EDITOR_UI.labels.addNote}
           draggable
           onDragStart={(e) => onDragStart(e, "note")}
           onClick={() => onClickAddNote()}
-          className={`flex items-center gap-3 w-full rounded-lg hover:bg-[var(--sidebar-item-hover)] transition-all text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] cursor-grab active:cursor-grabbing group ${
+          className={`flex items-center gap-3 w-full rounded-lg hover:bg-[var(--sidebar-item-hover)] transition-colors text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] cursor-grab active:cursor-grabbing group ${
             !isOpen ? "p-3 justify-center" : "px-3 py-2"
           }`}
           title={!isOpen ? "Sticky Note" : "Add a comment or note to the canvas"}
@@ -324,7 +322,7 @@ export function LeftSidebar() {
       </div>
 
       {/* Account footer */}
-      <div className="p-4 border-t border-[var(--sidebar-border)] flex flex-col gap-3 min-h-[72px]">
+      <div className="p-4 border-t border-[var(--sidebar-border)] flex flex-col gap-3 min-h-[72px] shrink-0">
         <div className={`flex items-center ${!isOpen ? 'justify-center' : 'justify-between'}`}>
           <div className={`flex items-center gap-3 ${!isOpen ? 'mx-auto' : ''}`}>
             <UserButton />
@@ -333,18 +331,20 @@ export function LeftSidebar() {
           {isOpen && (
             <div className="flex items-center gap-1">
               <a
-                href="https://galaxyai-e8601724.mintlify.app/"
+                href={APP_UI.docsUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="p-1.5 rounded-md hover:bg-[var(--sidebar-item-hover)] text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] transition-colors"
-                title="API Docs"
+                title={EDITOR_UI.labels.docs}
+              aria-label={EDITOR_UI.labels.docs}
               >
                 <BookOpen className="w-4 h-4" />
               </a>
               <Link
                 href="/settings/api-keys"
                 className="p-1.5 rounded-md hover:bg-[var(--sidebar-item-hover)] text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] transition-colors"
-                title="Settings"
+                title={EDITOR_UI.labels.settings}
+              aria-label={EDITOR_UI.labels.settings}
               >
                 <Settings className="w-4 h-4" />
               </Link>
@@ -354,24 +354,26 @@ export function LeftSidebar() {
         {!isOpen && (
           <>
             <a
-              href="https://galaxyai-e8601724.mintlify.app/"
+              href={APP_UI.docsUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="p-1.5 rounded-md hover:bg-[var(--sidebar-item-hover)] text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] transition-colors mx-auto"
-              title="API Docs"
+              title={EDITOR_UI.labels.docs}
+              aria-label={EDITOR_UI.labels.docs}
             >
               <BookOpen className="w-4 h-4" />
             </a>
             <Link
               href="/settings/api-keys"
               className="p-1.5 rounded-md hover:bg-[var(--sidebar-item-hover)] text-[var(--sidebar-icon)] hover:text-[var(--text-primary)] transition-colors mx-auto"
-              title="Settings"
+              title={EDITOR_UI.labels.settings}
+              aria-label={EDITOR_UI.labels.settings}
             >
               <Settings className="w-4 h-4" />
             </Link>
           </>
         )}
       </div>
-    </div>
+    </aside>
   );
 }

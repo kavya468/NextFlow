@@ -1,5 +1,6 @@
-import { Pool, neonConfig } from '@neondatabase/serverless';
+import { neonConfig } from '@neondatabase/serverless';
 import { PrismaNeon } from '@prisma/adapter-neon';
+import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
 import ws from 'ws';
 
@@ -40,12 +41,13 @@ function getClient(): PrismaClient {
     throw new Error('DATABASE_URL is strictly undefined or missing. Check your .env.');
   }
 
-  console.log('[db.ts] Initializing Neon config with URL length:', url.length);
-
   // In Prisma 7, PrismaNeon expects a PoolConfig object, NOT a Pool instance.
   // We pass the connection string, and PrismaNeon will internally create a neon.Pool 
   // using this config along with the globally defined ws constructor.
-  const adapter = new PrismaNeon({ connectionString: url });
+  const hostname = new URL(url).hostname;
+  const adapter = ['localhost', '127.0.0.1', '[::1]'].includes(hostname)
+    ? new PrismaPg({ connectionString: url })
+    : new PrismaNeon({ connectionString: url });
   const client = new PrismaClient({ adapter });
 
   if (process.env.NODE_ENV !== 'production') {

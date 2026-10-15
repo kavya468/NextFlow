@@ -1,42 +1,29 @@
 ---
 title: "Get Execution"
 openapi: "GET /v1/executions/{id}"
-description: "Poll or retrieve the status of a specific workflow execution run."
+description: "Read the persisted status and node results for a workflow run."
 ---
 
-## Authentication
-
-Requires a Bearer token.
-
-## Path Parameters
-
-| Parameter | Type | Required | Description |
-| --------- | ---- | -------- | ----------- |
-| `id`      | string| Yes      | The `runId` returned from an execute endpoint. |
-
-### Example Request
+Requires the owner's bearer API key. Pass the `runId` returned from an execution request as `id`.
 
 ```bash
-curl -X GET "https://next-flow-beta.vercel.app/api/v1/executions/123-execution-run-id" \
-  -H "Authorization: Bearer nf_YOUR_API_KEY"
+curl "$NEXTFLOW_ORIGIN/api/v1/executions/$RUN_ID" \
+  -H "Authorization: Bearer $NEXTFLOW_API_KEY"
 ```
 
-## Response
+The response contains `id`, `status`, `scope`, `nodeRuns`, and an optional `durationMs`.
 
-Returns the execution status (`PENDING`, `RUNNING`, `COMPLETED`, `FAILED`) and details of each inner `nodeRun`.
+| Run status | Meaning |
+| --- | --- |
+| `PENDING` | Accepted and waiting to start |
+| `RUNNING` | Worker has claimed execution |
+| `DISPATCH_UNKNOWN` | Worker dispatch could not be confirmed |
+| `CANCEL_REQUESTED` | Cancellation requested; unresolved work still needs confirmation |
+| `SUCCESS` | All admitted nodes succeeded |
+| `PARTIAL` | Some nodes succeeded and others failed or were blocked |
+| `FAILED` | Execution ended without a successful result |
+| `CANCELLED` | Cancellation reached a confirmed final state |
 
-```json
-{
-  "id": "123-execution-run-id",
-  "status": "COMPLETED",
-  "scope": "FULL",
-  "nodeRuns": [
-    {
-      "nodeId": "node_1",
-      "status": "COMPLETED",
-      "output": { "url": "..." }
-    }
-  ],
-  "durationMs": 4500
-}
-```
+Each node record includes its `nodeId`, `status`, `inputs`, and `outputs` when available. A node marked `BLOCKED` could not run because a dependency failed. An unconfirmed provider outcome can remain `RUNNING` until recovery establishes what happened.
+
+Run scope (`FULL`, `PARTIAL`, or `SINGLE`) describes which nodes were selected; run status describes their outcome. A task stopping at the worker service does not, by itself, prove that the application has recorded the result or settled the reservation.

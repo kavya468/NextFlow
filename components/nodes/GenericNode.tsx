@@ -27,6 +27,7 @@
 //   - Output preview with image thumbnails and text snippets
 // ============================================================================
 
+import { uploadDirectMedia } from "@/lib/upload-client";
 import { Handle, Position, useReactFlow } from "@xyflow/react";
 import { useStore, type NodeRunStatus } from "@/lib/store";
 import { useConnectedHandles } from "@/lib/useConnectedHandles";
@@ -172,73 +173,8 @@ function MediaSourceArea({
     setIsUploading(true);
     setUploadError(null);
     try {
-      // ── 1. Get signed params from our lightweight JSON endpoint ──────
-      const signRes = await fetch("/api/upload/sign", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type: mediaType }),
-      });
-
-      if (!signRes.ok) {
-        const errBody = await signRes.json().catch(() => ({}));
-        throw new Error(errBody.error || "Failed to get upload signature");
-      }
-      const { params, signature } = await signRes.json();
-
-      // ── 2. Upload file DIRECTLY to Transloadit (bypasses Next.js body limit) ──
-      const uploadForm = new FormData();
-      uploadForm.append("params", params);
-      uploadForm.append("signature", signature);
-      uploadForm.append("file", file, file.name);
-
-      const assemblyRes = await fetch(
-        "https://api2.transloadit.com/assemblies",
-        { method: "POST", body: uploadForm }
-      );
-      const assembly = await assemblyRes.json();
-
-      if (assembly.error) {
-        throw new Error(`Transloadit: ${assembly.error}`);
-      }
-
-      // ── 3. Poll assembly until completion ────────────────────────────
-      const assemblyUrl = assembly.assembly_ssl_url;
-      const maxWait = 120_000;
-      const start = Date.now();
-      let result: any = null;
-
-      while (Date.now() - start < maxWait) {
-        const pollRes = await fetch(assemblyUrl);
-        const pollData = await pollRes.json();
-
-        if (pollData.ok === "ASSEMBLY_COMPLETED") {
-          result = pollData;
-          break;
-        }
-        if (pollData.error) {
-          throw new Error(`Processing error: ${pollData.error}`);
-        }
-        // Wait 2s between polls
-        await new Promise((r) => setTimeout(r, 2000));
-      }
-
-      if (!result) {
-        throw new Error("Upload timed out after 120s");
-      }
-
-      // ── 4. Extract CDN URL from results ─────────────────────────────
-      // Try processed step first, then fall back to raw uploads
-      const stepKey =
-        mediaType === "video" ? "video_exported" : "image_exported";
-      const stepResults = result.results?.[stepKey];
-      const cdnUrl =
-        stepResults?.[0]?.ssl_url || result.uploads?.[0]?.ssl_url;
-
-      if (cdnUrl) {
-        updateField("url", cdnUrl);
-      } else {
-        throw new Error("No URL returned from upload");
-      }
+      const cdnUrl = await uploadDirectMedia(file, mediaType);
+      updateField("url", cdnUrl);
     } catch (error: any) {
       console.error("Upload error:", error);
       setUploadError(error.message || "Upload failed");
@@ -1239,7 +1175,7 @@ function OutputPreview({
         <div className="bg-[var(--node-inner-bg)] border border-[var(--status-success-border)] rounded-lg p-2">
           <div className="flex items-center justify-between mb-1">
             <span className="text-[9px] font-medium text-[var(--status-success)]">
-              ✓ {outputDef.label}
+              {outputDef.label}
             </span>
             <div className="flex gap-1">
               <button
@@ -1300,7 +1236,7 @@ function OutputPreview({
         <div className="bg-[var(--node-inner-bg)] border border-[var(--status-success-border)] rounded-lg p-2">
           <div className="flex items-center justify-between mb-1">
             <span className="text-[9px] font-medium text-[var(--status-success)]">
-              ✓ {outputDef.label}
+              {outputDef.label}
             </span>
             <div className="flex items-center gap-1">
               <button

@@ -13,6 +13,13 @@
 
 import crypto from "crypto";
 
+export function assertFalRequestId(payload: unknown, expectedRequestId: string) {
+  if (!expectedRequestId || !payload || typeof payload !== "object" ||
+      !("request_id" in payload) || payload.request_id !== expectedRequestId) {
+    throw new Error("Provider callback does not match the queued request");
+  }
+}
+
 function getSecret(): string {
   const secret = process.env.FAL_WEBHOOK_SECRET;
   if (!secret) {

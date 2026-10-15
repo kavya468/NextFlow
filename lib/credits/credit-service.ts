@@ -1,8 +1,23 @@
 import { prisma } from "@/lib/db";
 import { nodeRegistry } from "@/lib/nodes/registry";
-import type { NodeConfig } from "@/lib/nodes/types";
+import { Prisma } from "@prisma/client";
+import {
+  ExecutionNotFoundError,
+  InsufficientCreditsError,
+  OwnershipError,
+  ValidationError,
+} from "@/lib/services/errors";
 
 // 1,000,000 credits = $1.00 provider cost
+const MAX_CREDITS = 2_147_483_647;
+const TERMINAL_STATUSES = ["SUCCESS", "PARTIAL", "FAILED", "CANCELLED"];
+
+export function validateCreditAmount(amount: number, label = "Credit amount"): number {
+  if (!Number.isInteger(amount) || amount < 0 || amount > MAX_CREDITS) {
+    throw new ValidationError(`${label} must be an integer between 0 and ${MAX_CREDITS}`);
+  }
+  return amount;
+}
 
 /**
  * Read the user's credit balance from the ledger.
@@ -44,145 +59,172 @@ export async function estimateWorkflowCost(
       perNode.push({ nodeId: node.id, nodeType: node.type, estimate: 0 });
       continue;
     }
-    const estimate = config.credits.estimate(node.data ?? {});
+    const estimate = validateCreditAmount(config.credits.estimate(node.data ?? {}), `Estimate for ${node.id}`);
     perNode.push({ nodeId: node.id, nodeType: node.type, estimate });
-    total += estimate;
+    total = validateCreditAmount(total + estimate, "Workflow estimate");
   }
 
   return { total, perNode };
 }
 
-/**
- * Atomically reserve credits for a workflow run using SELECT FOR UPDATE.
- *
- * This prevents the TOCTOU race condition where multiple concurrent runs
- * all pass a non-locked balance check and collectively overdraw the account.
- *
- * Flow:
- *   1. Lock the user's ledger rows with FOR UPDATE (serializes concurrent checks)
- *   2. Compute current balance within the lock
- *   3. If sufficient, write a negative "reserve:run" entry immediately
- *   4. Return the remaining balance
- *
- * The reservation is later settled by `settleCredits()` which refunds the
- * difference between the estimated reserve and the actual cost.
- */
+async function lockRun(tx: Prisma.TransactionClient, userId: string, runId: string) {
+  // The account row exists even before its first ledger entry; always lock account before run.
+  await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
+  await tx.$queryRaw`SELECT id FROM "Run" WHERE id = ${runId} FOR UPDATE`;
+  const run = await tx.run.findUnique({ where: { id: runId } });
+  if (!run) throw new ExecutionNotFoundError(runId);
+  if (run.userId !== userId) throw new OwnershipError();
+  if (run.accountingVersion !== 1) {
+    throw new ValidationError("Legacy execution requires reconciliation before accounting changes");
+  }
+  return run;
+}
+
+/** Reserve once; node usage is recorded separately and never debits the ledger again. */
 export async function reserveCredits(
   userId: string,
   runId: string,
   estimatedAmount: number,
+  transaction?: Prisma.TransactionClient,
 ): Promise<{ reserved: number; remainingBalance: number }> {
-  if (estimatedAmount <= 0) {
-    const balance = await getBalance(userId);
-    return { reserved: 0, remainingBalance: balance };
-  }
+  validateCreditAmount(estimatedAmount, "Reservation");
+  const reserve = async (tx: Prisma.TransactionClient) => {
+    const run = await lockRun(tx, userId, runId);
+    const operationKey = `run:${runId}:reserve`;
+    const existing = await tx.creditLedger.findUnique({ where: { operationKey } });
+    const result = await tx.creditLedger.aggregate({ where: { userId }, _sum: { delta: true } });
+    const balance = result._sum.delta ?? 0;
+    if (!Number.isSafeInteger(balance)) throw new ValidationError("Credit balance exceeds the supported range");
 
-  return prisma.$transaction(async (tx) => {
-    // Acquire an advisory-style lock by locking the user's ledger rows.
-    // This serializes all concurrent credit checks for the same user.
-    // NOTE: FOR UPDATE cannot be combined with aggregate functions in
-    // PostgreSQL, so we lock first, then compute the balance separately.
-    await tx.$queryRaw`
-      SELECT 1
-      FROM "CreditLedger"
-      WHERE "userId" = ${userId}
-      FOR UPDATE
-    `;
-
-    const result: Array<{ balance: number }> = await tx.$queryRaw`
-      SELECT COALESCE(SUM(delta), 0)::int as balance
-      FROM "CreditLedger"
-      WHERE "userId" = ${userId}
-    `;
-
-    const balance = result[0]?.balance ?? 0;
-
-    if (balance < estimatedAmount) {
-      // Import is circular-safe because this is a runtime throw, not a module dep
-      const { InsufficientCreditsError } = await import("@/lib/services/errors");
+    if (existing) {
+      if (existing.userId !== userId || existing.delta !== -estimatedAmount || run.reservedCredits !== estimatedAmount) {
+        throw new ValidationError("Execution already has a different reservation");
+      }
+      return { reserved: estimatedAmount, remainingBalance: balance };
+    }
+    if (run.settledAt || TERMINAL_STATUSES.includes(run.status)) {
+      throw new ValidationError("Cannot reserve credits for a completed execution");
+    }
+    if (estimatedAmount > 0 && balance < estimatedAmount) {
       throw new InsufficientCreditsError(estimatedAmount, balance);
     }
 
-    // Immediately write a reserve entry — credits are now "held"
     await tx.creditLedger.create({
       data: {
         userId,
         delta: -estimatedAmount,
-        reason: `reserve:run`,
+        reason: "reserve:run",
         workflowRunId: runId,
+        operationKey,
       },
     });
+    await tx.run.update({ where: { id: runId }, data: { reservedCredits: estimatedAmount } });
+    return { reserved: estimatedAmount, remainingBalance: balance - estimatedAmount };
+  };
+  return transaction ? reserve(transaction) : prisma.$transaction(reserve);
+}
 
-    return {
-      reserved: estimatedAmount,
-      remainingBalance: balance - estimatedAmount,
-    };
+function jsonValue(value: unknown): Prisma.InputJsonValue | typeof Prisma.JsonNull {
+  return value == null ? Prisma.JsonNull : JSON.parse(JSON.stringify(value));
+}
+
+/** Persist successful output and its usage together; duplicate/late results do not change billing. */
+export async function recordNodeResult(
+  userId: string,
+  runId: string,
+  nodeId: string,
+  result: {
+    inputs?: unknown;
+    outputs: unknown;
+    providerUsed?: string;
+    creditsUsed: number;
+    durationMs?: number;
+  },
+): Promise<{ recorded: boolean; creditsUsed: number }> {
+  validateCreditAmount(result.creditsUsed, "Node usage");
+  return prisma.$transaction(async (tx) => {
+    const run = await lockRun(tx, userId, runId);
+    const nodes = await tx.nodeRun.findMany({ where: { runId, nodeId } });
+    if (nodes.length !== 1) throw new ValidationError("Execution must contain exactly one matching node");
+    const node = nodes[0];
+    if (run.settledAt || TERMINAL_STATUSES.includes(run.status) || !["PENDING", "RUNNING"].includes(node.status)) {
+      return { recorded: false, creditsUsed: node.creditsUsed };
+    }
+    await tx.nodeRun.update({
+      where: { id: node.id },
+      data: {
+        status: "SUCCESS",
+        error: null,
+        ...(result.inputs !== undefined && { inputs: jsonValue(result.inputs) }),
+        outputs: jsonValue(result.outputs),
+        providerUsed: result.providerUsed,
+        creditsUsed: result.creditsUsed,
+        durationMs: result.durationMs,
+      },
+    });
+    return { recorded: true, creditsUsed: result.creditsUsed };
   });
 }
 
-/**
- * Settle a credit reservation after a workflow run completes.
- *
- * Compares the reserved amount (written by `reserveCredits`) against the
- * actual credits consumed (sum of per-node deductions). If the actual cost
- * is less than the reservation, a positive "settle:refund" entry is written
- * to return the difference to the user.
- *
- * If actual cost exceeds the estimate (unlikely but possible with variable
- * pricing), the overage is absorbed — we never charge more than consumed.
- */
-export async function settleCredits(
+export type TerminalRunStatus = "SUCCESS" | "PARTIAL" | "FAILED" | "CANCELLED";
+
+/** Settle from persisted successful usage, absorbing overages above the reservation. */
+export async function finalizeRun(
   userId: string,
   runId: string,
-  reservedAmount: number,
-  actualAmount: number,
-): Promise<{ refunded: number }> {
-  const overpayment = reservedAmount - actualAmount;
-
-  if (overpayment <= 0) {
-    // Actual cost matched or exceeded estimate — nothing to refund
-    return { refunded: 0 };
-  }
-
-  // Refund the difference
-  await prisma.creditLedger.create({
-    data: {
-      userId,
-      delta: overpayment,
-      reason: `settle:refund`,
-      workflowRunId: runId,
-    },
-  });
-
-  return { refunded: overpayment };
-}
-
-/**
- * Deduct actual credits after a node completes successfully.
- * Writes a single negative ledger entry with the real cost.
- * Called once per node after the provider returns.
- *
- * NOTE: With the reserve/settle pattern, these per-node deductions are
- * tracked for reconciliation but the credits were already held upfront
- * by `reserveCredits()`. The orchestrator calls `settleCredits()` at
- * the end to refund any difference.
- */
-export async function deductCredits(
-  userId: string,
-  runId: string,
-  nodeRunId: string,
-  amount: number,
-  nodeType: string
-): Promise<void> {
-  if (amount <= 0) return;
-
-  await prisma.creditLedger.create({
-    data: {
-      userId,
-      delta: -amount,
-      reason: `node:${nodeType}`,
-      workflowRunId: runId,
-      nodeRunId,
-    },
+  status: TerminalRunStatus,
+  details: { error?: string; durationMs?: number; terminalNodeStatus?: "FAILED" | "CANCELLED"; requireUnclaimed?: boolean; expectedRecoveryAttempt?: number } = {},
+): Promise<{ status: string; reserved: number; actual: number; charged: number; refunded: number; settled: boolean }> {
+  return prisma.$transaction(async (tx) => {
+    const run = await lockRun(tx, userId, runId);
+    const reserved = validateCreditAmount(run.reservedCredits, "Stored reservation");
+    const nodes = await tx.nodeRun.findMany({ where: { runId }, select: { status: true, creditsUsed: true } });
+    const actual = nodes.reduce((total, node) => total + (node.status === "SUCCESS" ? validateCreditAmount(node.creditsUsed, "Stored node usage") : 0), 0);
+    if (!Number.isSafeInteger(actual)) throw new ValidationError("Total node usage exceeds the supported range");
+    if (run.settledAt) {
+      if (run.chargedCredits === null) throw new ValidationError("Settled execution has no recorded charge");
+      const charged = validateCreditAmount(run.chargedCredits, "Stored charge");
+      if (charged > reserved) throw new ValidationError("Stored charge exceeds the reservation");
+      return { status: run.status, reserved, actual, charged, refunded: reserved - charged, settled: false };
+    }
+    if (details.expectedRecoveryAttempt !== undefined && run.recoveryAttempt !== details.expectedRecoveryAttempt) {
+      throw new ValidationError("Execution recovery generation has changed");
+    }
+    if (details.requireUnclaimed && run.workerId) {
+      throw new ValidationError("Cannot release a reservation after a worker has claimed execution");
+    }
+    if (nodes.some((node) => node.status === "RUNNING")) {
+      throw new ValidationError("Cannot settle while node execution is unresolved");
+    }
+    if (status === "SUCCESS" && nodes.some((node) => node.status !== "SUCCESS")) {
+      throw new ValidationError("Cannot complete an execution with unfinished or failed nodes");
+    }
+    const reservation = await tx.creditLedger.findUnique({ where: { operationKey: `run:${runId}:reserve` } });
+    if (!reservation || reservation.userId !== userId || reservation.delta !== -reserved) {
+      throw new ValidationError("Execution reservation is missing or inconsistent");
+    }
+    const charged = Math.min(actual, reserved);
+    const refunded = reserved - charged;
+    await tx.creditLedger.create({
+      data: {
+        userId,
+        delta: refunded,
+        reason: "settle:refund",
+        workflowRunId: runId,
+        operationKey: `run:${runId}:settle`,
+      },
+    });
+    if (details.terminalNodeStatus) {
+      await tx.nodeRun.updateMany({
+        where: { runId, status: "PENDING" },
+        data: { status: details.terminalNodeStatus, error: details.error },
+      });
+    }
+    const completedAt = new Date();
+    await tx.run.update({
+      where: { id: runId },
+      data: { status, chargedCredits: charged, settledAt: completedAt, completedAt, durationMs: details.durationMs },
+    });
+    return { status, reserved, actual, charged, refunded, settled: true };
   });
 }

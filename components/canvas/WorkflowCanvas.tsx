@@ -12,6 +12,7 @@ import {
   ReactFlowProvider,
   ConnectionMode,
   Node,
+  type NodeTypes,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useStore } from "@/lib/store";
@@ -28,9 +29,10 @@ import { getIOTypeForHandle } from "@/lib/theme";
 // All initial nodes are now ported. Future unported nodes go here.
 
 import { CanvasControls } from "./CanvasControls";
-import { ExecutionControls } from "@/components/canvas/ExecutionControls";
+import { ExecutionControls, type ExecutionControlsProps } from "@/components/canvas/ExecutionControls";
 import { DeletableEdge } from "@/components/edges/DeletableEdge";
 import { CustomConnectionLine } from "@/components/edges/CustomConnectionLine";
+import { EDITOR_UI } from "@/lib/ui-config";
 import { showConnectionError } from "@/lib/connection-toasts";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -40,7 +42,7 @@ import { showConnectionError } from "@/lib/connection-toasts";
 // Config-driven nodes use GenericNode. Legacy nodes keep their old components
 // until each is ported to a config file in lib/nodes/configs/.
 // ─────────────────────────────────────────────────────────────────────────────
-const nodeTypes: Record<string, React.ComponentType<any>> = {
+const nodeTypes: NodeTypes = {
   // ── Config-driven (rendered by GenericNode) ──
   crop: GenericNode,
   text: GenericNode,
@@ -83,7 +85,7 @@ function wouldCreateCycle(edges: Edge[], connection: Connection): boolean {
   return false;
 }
 
-function Flow() {
+function Flow(props: ExecutionControlsProps) {
   const nodes = useStore((state) => state.nodes);
   const edges = useStore((state) => state.edges);
   const onNodesChange = useStore((state) => state.onNodesChange);
@@ -197,15 +199,11 @@ function Flow() {
         return false;
       }
 
-      // ── Strict type equality — bypass the registry's permissive
-      //    "text is universal wire" matrix. Only same-type connections allowed.
-      const srcIO = getIOTypeForHandle(sourceNodeType, sourceHandle, "output");
-      const tgtIO = getIOTypeForHandle(targetNodeType, targetHandle, "input");
-
-      if (!srcIO || !tgtIO) return false;
-
-      if (srcIO !== tgtIO) {
-        showConnectionError("type_mismatch", srcIO, tgtIO);
+      const valid = nodeRegistry.isValidConnection(sourceNodeType, sourceHandle, targetNodeType, targetHandle);
+      if (!valid) {
+        const sourceType = getIOTypeForHandle(sourceNodeType, sourceHandle, "output");
+        const targetType = getIOTypeForHandle(targetNodeType, targetHandle, "input");
+        if (sourceType && targetType) showConnectionError("type_mismatch", sourceType, targetType);
         return false;
       }
 
@@ -245,7 +243,7 @@ function Flow() {
   );
 
   return (
-    <div className="flex-1 h-full w-full bg-[var(--canvas-bg)] relative" ref={reactFlowWrapper}>
+    <div className="editor-canvas flex-1 min-h-0 w-full bg-[var(--canvas-bg)] relative" ref={reactFlowWrapper}>
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -258,7 +256,7 @@ function Flow() {
         defaultEdgeOptions={{ 
           type: "deletable",
           animated: true, 
-          style: { strokeWidth: 2, strokeOpacity: 0.7 },
+          style: { strokeWidth: 2, strokeOpacity: EDITOR_UI.edge.strokeOpacity },
           interactionWidth: 20,
         }}
         connectionLineComponent={CustomConnectionLine}
@@ -302,16 +300,18 @@ function Flow() {
         </div>
       )}
       
-      <CanvasControls />
-      <ExecutionControls />
+      <div id={EDITOR_UI.ids.controlDock} className="editor-control-dock">
+        <CanvasControls />
+        <ExecutionControls {...props} />
+      </div>
     </div>
   );
 }
 
-export function WorkflowCanvas() {
+export function WorkflowCanvas(props: ExecutionControlsProps) {
   return (
     <ReactFlowProvider>
-      <Flow />
+      <Flow {...props} />
     </ReactFlowProvider>
   );
 }

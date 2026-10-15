@@ -88,7 +88,7 @@ export async function addNode(
 
     await tx.workflow.update({
       where: { id: workflow.id },
-      data: { nodes: nodes as any },
+      data: { nodes: nodes as any, revision: { increment: 1 } },
     });
 
     return { nodeId, workflowId: workflow.id, workflowName: workflow.name };
@@ -165,7 +165,7 @@ export async function updateNode(
 
     await tx.workflow.update({
       where: { id: workflow.id },
-      data: { nodes: nodes as any },
+      data: { nodes: nodes as any, revision: { increment: 1 } },
     });
 
     return {
@@ -241,6 +241,7 @@ export async function deleteNode(
       data: {
         nodes: nodes as any,
         edges: edges as any,
+        revision: { increment: 1 },
       },
     });
 

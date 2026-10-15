@@ -69,3 +69,10 @@ export class DuplicateLabelError extends Error {
     this.duplicateLabels = duplicates;
   }
 }
+
+export class WorkflowConflictError extends Error {
+  constructor(message = "This workflow changed in another session. Reload the saved version before running or saving.") {
+    super(message);
+    this.name = "WorkflowConflictError";
+  }
+}

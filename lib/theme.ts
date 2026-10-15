@@ -14,6 +14,8 @@
 // ============================================================================
 
 import type { IOType, NodeCategory } from "@/lib/nodes/types";
+import { nodeRegistry } from "@/lib/nodes/registry";
+import { getInputDefinition } from "@/lib/nodes/handles";
 
 // ---------------------------------------------------------------------------
 // DataTypeTheme — the complete color spec for a single data type
@@ -153,8 +155,6 @@ export function getIOTypeForHandle(
   handleKey: string,
   direction: "input" | "output"
 ): IOType | null {
-  // Lazy import to avoid circular dependency at module init
-  const { nodeRegistry } = require("@/lib/nodes/registry");
   const config = nodeRegistry.get(nodeType);
   if (!config) return null;
 
@@ -165,26 +165,5 @@ export function getIOTypeForHandle(
     return output?.type ?? null;
   }
 
-  const input = config.inputs.find(
-    (i: { key: string }) => i.key === handleKey
-  );
-  
-  if (input) {
-    return input.type;
-  }
-
-  // ── Dynamic Handles Fallback ───────────────────────────────────────
-  // If the handle isn't explicitly defined in config.inputs, check if it's
-  // a known dynamic handle allowed by the config.
-  if (config.allowDynamicHandles) {
-    if (handleKey.startsWith("dialogue_text_")) {
-      return "text";
-    }
-    // Kling elements: element_N_frontal and element_N_ref_M are image handles
-    if (handleKey.startsWith("element_")) {
-      return "image";
-    }
-  }
-
-  return null;
+  return getInputDefinition(config, handleKey)?.type ?? null;
 }

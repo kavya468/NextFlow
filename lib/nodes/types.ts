@@ -106,6 +106,8 @@ export interface InputDefinition {
     step?: number;
     maxLength?: number;
     options?: Array<{ label: string; value: string }>;
+    /** Legacy saved select values mapped to canonical options during validation. */
+    aliases?: Record<string, string>;
     accept?: string;
   };
 
@@ -178,6 +180,12 @@ export interface OutputDefinition {
   /** Human-readable label shown next to the handle */
   label: string;
 
+  /** Array-valued media output; connects only to multi-value inputs. */
+  multi?: boolean;
+
+  /** Provider metadata can be absent; primary result outputs are required. */
+  optional?: boolean;
+
   /** Handle color override (auto-derived from type if not specified) */
   handleColor?: HandleColor;
 }
@@ -203,6 +211,9 @@ export interface ProviderEndpoint {
    * If not specified, input keys are passed through as-is.
    */
   inputMapping?: Record<string, string>;
+
+  /** Anchored developer-owned pattern for a task's enumerated dynamic handles. */
+  dynamicInputPattern?: string;
 
   /**
    * Maps task output keys → node output keys.

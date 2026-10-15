@@ -8,8 +8,9 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { RUN_UI } from "@/lib/ui-config";
 import { trpc } from "@/lib/trpc/client";
-import { Loader2, CheckCircle2, AlertTriangle, Play } from "lucide-react";
+import { CheckCircle2, AlertTriangle, Play } from "lucide-react";
 import { nodeRegistry } from "@/lib/nodes/registry";
 import "@/lib/nodes/configs";
 
@@ -45,12 +46,12 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
     data: (n.data as Record<string, unknown>) ?? {},
   }));
 
-  const { data: balanceData, isLoading: balanceLoading } = trpc.credits.getBalance.useQuery(
+  const { data: balanceData, isLoading: balanceLoading, error: balanceError } = trpc.credits.getBalance.useQuery(
     undefined,
     { enabled: open, staleTime: 5_000 }
   );
 
-  const { data: estimateData, isLoading: estimateLoading } = trpc.credits.estimateNodes.useQuery(
+  const { data: estimateData, isLoading: estimateLoading, error: estimateError } = trpc.credits.estimateNodes.useQuery(
     { nodes: nodesForEstimate },
     { enabled: open }
   );
@@ -59,7 +60,8 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
   const total = estimateData?.total ?? 0;
   const perNode = estimateData?.perNode ?? [];
   const isLoading = balanceLoading || estimateLoading;
-  const isSufficient = balance >= total;
+  const hasQuote = !!balanceData && !!estimateData && !balanceError && !estimateError;
+  const isSufficient = hasQuote && balance >= total;
   const afterRun = balance - total;
 
   const maxEstimate = Math.max(...perNode.map((n) => n.estimate), 1);
@@ -68,9 +70,9 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md bg-[var(--popover-bg)] border-[var(--popover-border)] text-[var(--text-primary)]">
         <DialogHeader>
-          <DialogTitle className="text-[var(--text-primary)]">Workflow Cost Estimate</DialogTitle>
+          <DialogTitle className="text-[var(--text-primary)]">{RUN_UI.labels.reservationTitle}</DialogTitle>
           <DialogDescription className="text-[var(--text-secondary)]">
-            Review the estimated credit cost before running.
+            {RUN_UI.messages.reservation}
           </DialogDescription>
         </DialogHeader>
 
@@ -81,6 +83,8 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
                 <div key={i} className="h-8 rounded-md bg-[var(--hover-bg)] animate-pulse" />
               ))}
             </div>
+          ) : !hasQuote ? (
+            <p className="text-xs text-[var(--status-error)]" role="alert">{RUN_UI.messages.reservationUnavailable}</p>
           ) : (
             <>
               {/* Per-node breakdown */}
@@ -105,8 +109,8 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
                       </div>
                       <span className="font-mono tabular-nums text-[var(--text-secondary)] w-24 text-right">
                         {isFree
-                          ? <span className="text-[var(--text-muted)]">internal</span>
-                          : `~${node.estimate.toLocaleString("en-US")} cr`
+                          ? <span className="text-[var(--text-muted)]">{RUN_UI.labels.noReservation}</span>
+                          : `${node.estimate.toLocaleString()} cr`
                         }
                       </span>
                     </div>
@@ -120,13 +124,13 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
               {/* Totals */}
               <div className="space-y-2 text-xs">
                 <div className="flex justify-between">
-                  <span className="text-[var(--text-secondary)]">Total estimate</span>
+                  <span className="text-[var(--text-secondary)]">{RUN_UI.labels.maximumReservation}</span>
                   <span className="font-mono tabular-nums font-medium text-[var(--text-primary)]">
-                    ~{total.toLocaleString("en-US")} cr
+                    {total.toLocaleString()} cr
                   </span>
                 </div>
                 <div className="flex justify-between items-center">
-                  <span className="text-[var(--text-secondary)]">Your balance</span>
+                  <span className="text-[var(--text-secondary)]">{RUN_UI.labels.availableBalance}</span>
                   <span className="flex items-center gap-1.5">
                     <span className="font-mono tabular-nums text-[var(--text-primary)]">
                       {balance.toLocaleString("en-US")} cr
@@ -140,13 +144,16 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
                 </div>
                 {isSufficient && (
                   <div className="flex justify-between">
-                    <span className="text-[var(--text-secondary)]">After run</span>
+                    <span className="text-[var(--text-secondary)]">{RUN_UI.labels.afterReservation}</span>
                     <span className="font-mono tabular-nums text-[var(--text-secondary)]">
-                      ~{afterRun.toLocaleString("en-US")} cr
+                      {afterRun.toLocaleString()} cr
                     </span>
                   </div>
                 )}
               </div>
+
+              <p className="text-[11px] text-[var(--text-secondary)]">{RUN_UI.messages.settlement}</p>
+              {total > 0 && <p className="text-[11px] text-[var(--text-muted)]">{RUN_UI.messages.zeroChargeReservation}</p>}
 
               {/* Insufficient warning */}
               {!isSufficient && (
@@ -155,10 +162,10 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
                     <AlertTriangle className="w-4 h-4 text-[var(--status-error)] mt-0.5 shrink-0" />
                     <div>
                       <p className="text-xs font-medium text-[var(--status-error)]">
-                        Insufficient Credits
+                        {RUN_UI.labels.insufficientReservation}
                       </p>
                       <p className="text-[11px] text-[var(--status-error)] opacity-80 mt-0.5">
-                        This workflow needs ~{total.toLocaleString("en-US")} cr.
+                        This workflow holds {total.toLocaleString()} cr.
                         You have {balance.toLocaleString("en-US")} cr remaining.
                       </p>
                       <a
@@ -180,7 +187,7 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
             onClick={() => onOpenChange(false)}
             className="px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
           >
-            Cancel
+            {RUN_UI.labels.cancel}
           </button>
           <button
             onClick={() => {
@@ -197,7 +204,7 @@ export function PreRunModal({ open, onOpenChange, nodes, onConfirm }: PreRunModa
             `}
           >
             <Play className="w-3 h-3" />
-            Confirm & Run
+            {RUN_UI.labels.confirmReservation}
           </button>
         </DialogFooter>
       </DialogContent>

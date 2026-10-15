@@ -2,307 +2,164 @@ import { describe, it, expect } from "vitest";
 import { seedreamConfig } from "../seedream.config";
 import { nodeRegistry } from "../../registry";
 
-// Register at module scope so it's available when describe blocks evaluate
 nodeRegistry.register(seedreamConfig);
 
-// ============================================================================
-// Credits
-// ============================================================================
-
+// The node now selects an explicit mode and dispatches one Seedream task.
+// These tests exercise its public registry contract without calling fal.ai.
 describe("seedream credits", () => {
-  it("estimate() always returns 15000", () => {
-    expect(seedreamConfig.credits.estimate({})).toBe(15000);
-    expect(seedreamConfig.credits.estimate({ prompt: "a cat" })).toBe(15000);
-    expect(
-      seedreamConfig.credits.estimate({
-        prompt: "a long detailed prompt ".repeat(100),
-        image_url: "https://example.com/img.jpg",
-      })
-    ).toBe(15000);
+  it("reserves the maximum 36 generated images even when controls arrive upstream", () => {
+    expect(seedreamConfig.credits.estimate({})).toBe(1_440_000);
+    expect(seedreamConfig.credits.estimate({ mode: "generate", prompt: "a cat" })).toBe(1_440_000);
+    expect(seedreamConfig.credits.estimate({ mode: "edit", prompt: "a cat", num_images: 6, max_images: 6 })).toBe(1_440_000);
   });
 
-  it("calculate() returns response.credits_used when present", () => {
-    const result = seedreamConfig.credits.calculate(
-      { prompt: "test" },
-      { credits_used: 12345 }
-    );
-    expect(result).toBe(12345);
+  it("converts response cost to microcredits and rounds upward", () => {
+    expect(seedreamConfig.credits.calculate({}, { cost: 0.0123454 })).toBe(12_346);
+    expect(seedreamConfig.credits.calculate({}, { cost: 0 })).toBe(0);
   });
 
-  it("calculate() returns 15000 fallback when credits_used is missing", () => {
-    expect(seedreamConfig.credits.calculate({}, {})).toBe(15000);
-    expect(seedreamConfig.credits.calculate({}, null)).toBe(15000);
-    expect(seedreamConfig.credits.calculate({}, undefined)).toBe(15000);
-    expect(
-      seedreamConfig.credits.calculate({}, { some_other_field: 999 })
-    ).toBe(15000);
-  });
+  it.each([{}, null, undefined, { cost: "0.01" }, { cost: null }, { credits_used: 12345 }])(
+    "rejects absent usage instead of inventing a fixed image charge: %j",
+    (response) => {
+      expect(() => seedreamConfig.credits.calculate({}, response)).toThrow("generated image count");
+    },
+  );
 
-  it("calculate() returns 15000 when credits_used is not a number", () => {
-    expect(
-      seedreamConfig.credits.calculate({}, { credits_used: "not a number" })
-    ).toBe(15000);
-    expect(
-      seedreamConfig.credits.calculate({}, { credits_used: null })
-    ).toBe(15000);
+  it("charges the returned image count rather than every requested maximum", () => {
+    expect(seedreamConfig.credits.calculate({ num_images: 6, max_images: 6 }, { generatedImageCount: 2 })).toBe(80_000);
   });
 });
 
-// ============================================================================
-// Zod Input Schema
-// ============================================================================
-
-describe("seedream Zod input schema", () => {
+describe("seedream registry input schema", () => {
   const schema = nodeRegistry.getInputSchema("seedream-4.5");
+  const valid = { mode: "generate", prompt: "a beautiful sunset" };
 
-  it("rejects missing prompt", () => {
-    const result = schema.safeParse({});
-    expect(result.success).toBe(false);
+  it("requires both an explicit mode and a string prompt", () => {
+    expect(schema.safeParse({ mode: "generate" }).success).toBe(false);
+    expect(schema.safeParse({ prompt: "a sunset" }).success).toBe(false);
+    expect(schema.safeParse({ ...valid, prompt: 123 }).success).toBe(false);
+    expect(schema.safeParse(valid).success).toBe(true);
   });
 
-  it("rejects empty string prompt", () => {
-    const result = schema.safeParse({ prompt: "" });
-    // Zod z.string() allows empty strings — the Trigger.dev task validates non-empty
-    // The schema itself only enforces type: string, required: true
-    expect(result.success).toBe(true);
+  it("allows empty draft text at the registry layer", () => {
+    // The task's input schema owns non-empty prompt validation before generation.
+    expect(schema.safeParse({ ...valid, prompt: "" }).success).toBe(true);
   });
 
-  it("accepts valid prompt-only input", () => {
-    const result = schema.safeParse({ prompt: "a beautiful sunset" });
-    expect(result.success).toBe(true);
+  it("rejects unsupported modes and image-size presets", () => {
+    expect(schema.safeParse({ ...valid, mode: "inpaint" }).success).toBe(false);
+    expect(schema.safeParse({ ...valid, image_size: "16:9" }).success).toBe(false);
   });
 
-  it("accepts all optional fields", () => {
-    const result = schema.safeParse({
-      prompt: "a beautiful sunset",
-      image_url: "https://example.com/img.jpg",
-      aspect_ratio: "16:9",
-      guidance_scale: 10,
-      num_inference_steps: 40,
-      seed: 42,
-    });
-    expect(result.success).toBe(true);
-  });
-
-  it("rejects invalid aspect_ratio value", () => {
-    const result = schema.safeParse({
-      prompt: "test",
-      aspect_ratio: "2:1",
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it("rejects guidance_scale below minimum (1)", () => {
-    const result = schema.safeParse({
-      prompt: "test",
-      guidance_scale: 0,
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it("rejects guidance_scale above maximum (20)", () => {
-    const result = schema.safeParse({
-      prompt: "test",
-      guidance_scale: 25,
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it("rejects num_inference_steps below minimum (1)", () => {
-    const result = schema.safeParse({
-      prompt: "test",
-      num_inference_steps: 0,
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it("rejects num_inference_steps above maximum (50)", () => {
-    const result = schema.safeParse({
-      prompt: "test",
-      num_inference_steps: 100,
-    });
-    expect(result.success).toBe(false);
-  });
-
-  it("applies default values for optional fields", () => {
-    const result = schema.safeParse({ prompt: "test" });
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.aspect_ratio).toBe("1:1");
-      expect(result.data.guidance_scale).toBe(7.5);
-      expect(result.data.num_inference_steps).toBe(30);
-    }
-  });
-});
-
-// ============================================================================
-// Endpoint Selection
-// ============================================================================
-
-describe("seedream endpoint selection", () => {
-  it("selects edit endpoint when image_url is present", () => {
-    const resolved = nodeRegistry.resolveEndpoint("seedream-4.5", {
+  it("accepts the current optional fields", () => {
+    const input = {
+      mode: "edit",
       prompt: "make the sky blue",
-      image_url: "https://example.com/photo.jpg",
-    });
-
-    expect(resolved).not.toBeNull();
-    expect(resolved!.endpointId).toBe("seedream-edit");
-    expect(resolved!.taskId).toBe("seedream-4.5");
-    expect(resolved!.payload).toHaveProperty("image_url");
-  });
-
-  it("selects generate endpoint when image_url is absent", () => {
-    const resolved = nodeRegistry.resolveEndpoint("seedream-4.5", {
-      prompt: "a beautiful sunset",
-    });
-
-    expect(resolved).not.toBeNull();
-    expect(resolved!.endpointId).toBe("seedream-generate");
-    expect(resolved!.taskId).toBe("seedream-4.5");
-    expect(resolved!.payload).not.toHaveProperty("image_url");
-  });
-
-  it("selects generate endpoint when image_url is empty string", () => {
-    const resolved = nodeRegistry.resolveEndpoint("seedream-4.5", {
-      prompt: "a landscape",
-      image_url: "",
-    });
-
-    expect(resolved).not.toBeNull();
-    expect(resolved!.endpointId).toBe("seedream-generate");
-  });
-
-  it("selects generate endpoint when image_url is whitespace only", () => {
-    const resolved = nodeRegistry.resolveEndpoint("seedream-4.5", {
-      prompt: "a landscape",
-      image_url: "   ",
-    });
-
-    expect(resolved).not.toBeNull();
-    expect(resolved!.endpointId).toBe("seedream-generate");
-  });
-
-  it("maps inputs correctly for the generate endpoint", () => {
-    const resolved = nodeRegistry.resolveEndpoint("seedream-4.5", {
-      prompt: "a sunset",
-      aspect_ratio: "16:9",
-      guidance_scale: 10,
-      num_inference_steps: 40,
+      image_urls: "https://example.com/image.jpg",
+      image_size: "landscape_16_9",
+      num_images: 2,
+      max_images: 3,
+      enable_safety_checker: false,
       seed: 42,
-    });
+    };
+    expect(schema.parse(input)).toEqual({ ...input, image_urls: [input.image_urls] });
+  });
 
-    expect(resolved).not.toBeNull();
-    expect(resolved!.payload).toEqual({
+  it.each(["num_images", "max_images"])("enforces the 1–6 range for %s", (field) => {
+    expect(schema.safeParse({ ...valid, [field]: 0 }).success).toBe(false);
+    expect(schema.safeParse({ ...valid, [field]: 7 }).success).toBe(false);
+    expect(schema.safeParse({ ...valid, [field]: 1 }).success).toBe(true);
+    expect(schema.safeParse({ ...valid, [field]: 6 }).success).toBe(true);
+  });
+
+  it("enforces the seed range and preserves seed zero", () => {
+    expect(schema.safeParse({ ...valid, seed: -1 }).success).toBe(false);
+    expect(schema.safeParse({ ...valid, seed: 2_147_483_648 }).success).toBe(false);
+    expect(schema.parse({ ...valid, seed: 0 }).seed).toBe(0);
+  });
+
+  it("applies generation defaults without overriding the provider image size", () => {
+    expect(schema.parse(valid)).toEqual({
+      ...valid,
+      num_images: 1,
+      max_images: 1,
+      enable_safety_checker: true,
+    });
+  });
+});
+
+describe("seedream dispatch mapping", () => {
+  it.each(["generate", "edit"])("dispatches %s through the shared task with its mode", (mode) => {
+    const resolved = nodeRegistry.resolveEndpoint("seedream-4.5", {
+      mode,
       prompt: "a sunset",
-      aspect_ratio: "16:9",
-      guidance_scale: 10,
-      num_inference_steps: 40,
-      seed: 42,
+    });
+    expect(resolved).toMatchObject({
+      providerId: "fal",
+      endpointId: "seedream",
+      taskId: "seedream-4.5",
+      payload: { mode, prompt: "a sunset" },
     });
   });
 
-  it("maps inputs correctly for the edit endpoint", () => {
-    const resolved = nodeRegistry.resolveEndpoint("seedream-4.5", {
-      prompt: "make brighter",
-      image_url: "https://example.com/photo.jpg",
-      guidance_scale: 5,
-    });
-
-    expect(resolved).not.toBeNull();
-    expect(resolved!.payload).toEqual({
-      prompt: "make brighter",
-      image_url: "https://example.com/photo.jpg",
-      guidance_scale: 5,
-    });
+  it("forwards current generation options including false and zero values", () => {
+    const input = {
+      mode: "generate",
+      prompt: "a sunset",
+      image_size: "landscape_16_9",
+      num_images: 2,
+      max_images: 3,
+      enable_safety_checker: false,
+      seed: 0,
+    };
+    expect(nodeRegistry.resolveEndpoint("seedream-4.5", input)?.payload).toEqual(input);
   });
 
-  it("omits undefined optional fields from payload", () => {
+  it("forwards the source image under image_urls in edit mode", () => {
+    const input = {
+      mode: "edit",
+      prompt: "make brighter",
+      image_urls: "https://example.com/photo.jpg",
+    };
+    expect(nodeRegistry.resolveEndpoint("seedream-4.5", input)?.payload).toEqual(input);
+  });
+
+  it("omits unspecified options and obsolete provider fields", () => {
     const resolved = nodeRegistry.resolveEndpoint("seedream-4.5", {
+      mode: "generate",
       prompt: "a cat",
+      image_size: undefined,
+      guidance_scale: 10,
+      num_inference_steps: 40,
+      aspect_ratio: "16:9",
     });
+    expect(resolved?.payload).toEqual({ mode: "generate", prompt: "a cat" });
+  });
 
-    expect(resolved).not.toBeNull();
-    const keys = Object.keys(resolved!.payload);
-    expect(keys).toEqual(["prompt"]);
+  it("maps the task image output to the image handle", () => {
+    expect(nodeRegistry.mapOutput("seedream-4.5", "seedream", {
+      image_url: "https://fal.media/files/output.png",
+    })).toEqual({ image_url: "https://fal.media/files/output.png" });
   });
 });
 
-// ============================================================================
-// Output Mapping
-// ============================================================================
-
-describe("seedream output mapping", () => {
-  it("maps task output image_url to node output image_url", () => {
-    const mapped = nodeRegistry.mapOutput("seedream-4.5", "seedream-generate", {
-      image_url: "https://fal.media/files/output.png",
-    });
-    expect(mapped).toEqual({
-      image_url: "https://fal.media/files/output.png",
-    });
-  });
-
-  it("maps correctly for edit endpoint too", () => {
-    const mapped = nodeRegistry.mapOutput("seedream-4.5", "seedream-edit", {
-      image_url: "https://fal.media/files/edited.png",
-    });
-    expect(mapped).toEqual({
-      image_url: "https://fal.media/files/edited.png",
-    });
-  });
-});
-
-// ============================================================================
-// Config Metadata
-// ============================================================================
-
-describe("seedream config metadata", () => {
-  it("has correct id and name", () => {
-    expect(seedreamConfig.id).toBe("seedream-4.5");
-    expect(seedreamConfig.name).toBe("Seedream 4.5");
-  });
-
-  it("is categorized as AI node", () => {
-    expect(seedreamConfig.category).toBe("ai");
-  });
-
-  it("is not a passthrough node", () => {
-    expect(seedreamConfig.isPassthrough).toBeUndefined();
-  });
-
-  it("has exactly one output of type image", () => {
-    expect(seedreamConfig.outputs).toHaveLength(1);
-    expect(seedreamConfig.outputs[0].type).toBe("image");
-    expect(seedreamConfig.outputs[0].key).toBe("image_url");
-  });
-
-  it("has prompt as the only required input", () => {
-    const required = seedreamConfig.inputs.filter((i) => i.required);
-    expect(required).toHaveLength(1);
-    expect(required[0].key).toBe("prompt");
-  });
-
-  it("has 3 advanced inputs", () => {
-    const advanced = seedreamConfig.inputs.filter((i) => i.isAdvanced);
-    expect(advanced).toHaveLength(3);
-    expect(advanced.map((a) => a.key).sort()).toEqual([
-      "guidance_scale",
-      "num_inference_steps",
-      "seed",
-    ]);
-  });
-
-  it("is registered in the node registry", () => {
-    expect(nodeRegistry.has("seedream-4.5")).toBe(true);
+describe("seedream palette and controls", () => {
+  it("registers both the first image and complete image array outputs", () => {
     expect(nodeRegistry.get("seedream-4.5")).toBe(seedreamConfig);
+    expect(seedreamConfig.isPassthrough).toBeUndefined();
+    expect(seedreamConfig.outputs).toEqual([{ key: "image_url", type: "image", label: "Image" }, { key: "image_urls", type: "image", label: "All Images", multi: true }]);
+    expect(nodeRegistry.getPaletteEntries()).toContainEqual(expect.objectContaining({
+      type: "seedream-4.5",
+      label: "Seedream 4.5",
+      category: "ai",
+      icon: "Sparkles",
+    }));
   });
 
-  it("appears in palette entries", () => {
-    const entries = nodeRegistry.getPaletteEntries();
-    const seedream = entries.find((e) => e.type === "seedream-4.5");
-    expect(seedream).toBeDefined();
-    expect(seedream!.label).toBe("Seedream 4.5");
-    expect(seedream!.category).toBe("ai");
-    expect(seedream!.icon).toBe("Sparkles");
+  it("requires mode and prompt and exposes generation count/safety controls", () => {
+    expect(seedreamConfig.inputs.filter((input) => input.required).map((input) => input.key))
+      .toEqual(["mode", "prompt"]);
+    expect(seedreamConfig.inputs.filter((input) => input.isAdvanced).map((input) => input.key).sort())
+      .toEqual(["enable_safety_checker", "max_images", "num_images", "seed"]);
   });
 });
