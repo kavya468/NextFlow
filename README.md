@@ -1,21 +1,62 @@
+<p align="center">
+  <img src="docs/media/nextflow-cover.svg" alt="NextFlow — Your ideas, connected. Text, image, audio, and video on one canvas." width="100%" />
+</p>
+
+<p align="center">
+  <a href="#inside-the-canvas">The canvas</a> &nbsp; / &nbsp;
+  <a href="#run-locally">Run locally</a> &nbsp; / &nbsp;
+  <a href="docs/quickstart.mdx">API reference</a> &nbsp; / &nbsp;
+  <a href="#where-the-project-stands">Project status</a>
+</p>
+
 # NextFlow
 
-A visual workflow editor for connecting text, image, audio, and video tools. Build a graph, supply inputs, run the pipeline, and inspect the values passed between steps.
+A prompt becomes an image. An image becomes a shot. A voice gives it a story.
 
-Created by [Kavya](https://github.com/kavya468).
+**NextFlow is a visual workspace for connecting those steps.** Place text, image, audio, and video tools on a canvas, wire their inputs together, and follow the values from one node to the next. The graph stays editable, the runs stay inspectable, and the same idea can take a different path without starting over.
 
-## What it does
+Built and maintained by [Kavya](https://github.com/kavya468).
 
-- **Visual composition:** typed connections, reusable templates, JSON import/export, and a configurable node palette.
-- **Execution:** whole workflows or selected nodes with their dependencies, persistent run history, cancellation, and recovery of interrupted runs.
-- **Input handling:** validates connected values and provider payloads; failed dependencies block downstream steps instead of reusing stale results.
-- **Credit accounting:** reserves the maximum allowed cost before dispatch, records successful usage, and settles once. Unconfirmed provider outcomes retain their reservation.
-- **Draft protection:** serializes autosaves and checks workflow revisions. Conflicts preserve the local draft for export or explicit reload.
-- **Programmatic access:** authenticated REST endpoints and an HTTP MCP endpoint for workflow management and execution.
+## Inside the canvas
 
-The registry contains 15 node types: text, image and video inputs; Gemini and OpenRouter text generation; Seedream images; Seedance video; ElevenLabs dialogue; image cropping, frame/audio extraction and media merging; Kling editing and lipsync. **Kling and lipsync execution are currently disabled** until duration-based billing can be verified. See [billing policy and limits](docs/BILLING_POLICY.md).
+![The NextFlow editor showing a text brief connected to Seedream image generation and Seedance video generation](docs/media/nextflow-editor.png)
 
-## Architecture
+<sub>A local example graph: a paper-city brief → an image step → a motion step. This is the real editor; the screenshot shows composition, not a completed paid-provider run.</sub>
+
+### Start with an idea. Keep the connections.
+
+Drop in a prompt or a piece of media. Connect the output you need to the next tool's input. Typed ports make the handoff explicit; connected fields show where their values come from. Reuse a template, rearrange the graph, or export it as JSON to pick up later.
+
+### Look inside the run.
+
+Run the whole graph or a selection with its dependencies, then open the history to inspect each step's inputs and outputs. Failed dependencies block their downstream nodes. Completed results remain visible when another branch fails, and recovery checks confirmed worker results before continuing interrupted work.
+
+### Keep the work you have already done.
+
+Autosave checks revisions so a second session cannot silently overwrite a newer draft. A conflict keeps your local work available to export. Before a paid run starts, NextFlow shows the maximum credit reservation; confirmed usage settles once, and uncertain provider outcomes keep their hold until they can be resolved.
+
+## The toolbox
+
+| Bring in | Generate | Shape and assemble |
+| --- | --- | --- |
+| Text, images, video | Gemini and OpenRouter text | Crop images |
+| Connected values from earlier nodes | Seedream images, Seedance video | Extract frames or audio |
+| Reusable workflow templates | ElevenLabs dialogue | Merge clips or replace a soundtrack |
+
+The registry contains **15 node types**. Kling editing and lipsync are present in the editor but **execution is disabled** until duration-based billing can be verified. See [billing policy and limits](docs/BILLING_POLICY.md) for the current boundaries.
+
+## Beneath the canvas
+
+Every run starts from a saved graph snapshot. The web app validates the request and reserves credits; a Trigger.dev worker executes the snapshot and records each node's result. The editor reads that persisted state, so a worker completion notification by itself does not establish that billing has settled.
+
+```mermaid
+flowchart LR
+    Canvas["Compose & save"] --> Snapshot["Validate & snapshot"]
+    Snapshot --> Reserve["Reserve credits"]
+    Reserve --> Worker["Execute nodes"]
+    Worker --> Results["Persist results & settle"]
+    Results --> History["Inspect & recover"]
+```
 
 | Area | Implementation |
 | --- | --- |
@@ -25,8 +66,6 @@ The registry contains 15 node types: text, image and video inputs; Gemini and Op
 | Persistence | PostgreSQL, Prisma, transactional credit ledger |
 | Background execution | Trigger.dev tasks, provider adapters, FFmpeg |
 | Media storage | Signed Transloadit uploads |
-
-The web application validates and snapshots a workflow before creating a run. Trigger.dev workers execute that snapshot and persist node inputs, outputs, and accounting results. The UI reads the database state; a worker completion event alone does not establish that billing has settled.
 
 ## Run locally
 
@@ -59,7 +98,13 @@ Configure provider credentials in the worker environment for the nodes you use. 
 
 Paid nodes require a funded credit ledger. There is no self-service purchase flow or automatic development credit grant. Start with a Text-to-Text workflow to check dispatch and input propagation without paid providers.
 
-## Development checks
+## Working on NextFlow
+
+The project uses TypeScript source throughout the application. Shared interaction copy lives in `lib/ui-config.ts`; visual tokens live in `app/globals.css`. Keep UI changes small and consistent with the existing editor.
+
+<details>
+<summary><strong>Checks and test setup</strong></summary>
+
 
 | Command | Purpose |
 | --- | --- |
@@ -75,6 +120,27 @@ The database tests require a **disposable loopback PostgreSQL database named `ne
 
 [CI](.github/workflows/ci.yml) checks types, boundary/test lint, unit tests, PostgreSQL integration tests, and the production build. Full application lint is reported separately while older lint debt is addressed. Native media tests require FFmpeg and FFprobe; CI installs them explicitly.
 
+</details>
+
+<details>
+<summary><strong>Find your way around the source</strong></summary>
+
+| Path | Contents |
+| --- | --- |
+| `app/`, `components/`, `hooks/` | Pages, editor UI, and save coordination |
+| `lib/nodes/` | Node contracts, provider mappings, and registry |
+| `lib/services/`, `lib/credits/` | Workflow lifecycle, recovery, and accounting |
+| `lib/ui-config.ts`, `app/globals.css` | Shared interaction/copy settings and visual tokens |
+| `server/trpc/` | Authenticated application and REST procedures |
+| `src/trigger/` | Background orchestration and provider/media tasks |
+| `prisma/` | Database schema and versioned migrations |
+| `lib/__tests__/`, `hooks/__tests__/`, `tests/` | Regression tests and local verification fixtures |
+| `docs/` | API reference, billing policy, and README visuals |
+
+Generated JavaScript, Prisma clients, build output, credentials, local agent configuration, and design experiments are excluded from version control.
+
+</details>
+
 ## REST and MCP
 
 Generate an API key from **Settings > API Keys**. REST requests use `Authorization: Bearer <key>` and the `/api/v1` prefix:
@@ -88,23 +154,7 @@ The generated specification is served at `/api/v1/openapi.json`. Request example
 
 MCP clients connect to `/api/mcp` using HTTP transport and the same bearer API key. The server exposes workflow discovery, graph editing, and execution tools. There is no separate stdio MCP server to install.
 
-## Source layout
-
-| Path | Contents |
-| --- | --- |
-| `app/`, `components/`, `hooks/` | Pages, editor UI, and save coordination |
-| `lib/nodes/` | Node contracts, provider mappings, and registry |
-| `lib/services/`, `lib/credits/` | Workflow lifecycle, recovery, and accounting |
-| `lib/ui-config.ts`, `app/globals.css` | Shared interaction/copy settings and visual tokens |
-| `server/trpc/` | Authenticated application and REST procedures |
-| `src/trigger/` | Background orchestration and provider/media tasks |
-| `prisma/` | Database schema and versioned migrations |
-| `lib/__tests__/`, `hooks/__tests__/`, `tests/` | Regression tests and local verification fixtures |
-| `docs/` | API reference and billing policy |
-
-Generated JavaScript, Prisma clients, build output, credentials, local agent configuration, and design experiments are excluded from version control.
-
-## Release status
+## Where the project stands
 
 This branch includes changes to the database schema, task payloads, and accounting contract. The application and worker must be released together after migrations and staging verification; updating only one is insufficient.
 
@@ -116,4 +166,4 @@ Before the first release of this execution contract, configure the environment v
 
 ## Ownership
 
-This repository is maintained by Kavya. The project remains proprietary; publishing its source does not grant an open-source license. Third-party libraries and services retain their respective licenses and terms.
+NextFlow is a personal project built and maintained by [Kavya](https://github.com/kavya468). The source is public for inspection; the project remains proprietary, and publication does not grant an open-source license. Third-party libraries and services retain their respective licenses and terms.
