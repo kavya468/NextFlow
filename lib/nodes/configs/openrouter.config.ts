@@ -1,4 +1,5 @@
 import type { NodeConfig } from "../types";
+import { BILLING_LIMITS, estimateNodeReservation, OPENROUTER_MODEL_ALIASES } from "../../credits/billing-policy";
 
 export const openrouterConfig: NodeConfig = {
   id: "openrouter-llm",
@@ -6,7 +7,7 @@ export const openrouterConfig: NodeConfig = {
   description: "Generate text with OpenRouter chat models",
   category: "logic",
   icon: "Bot",
-  version: "1.0.0",
+  version: "2.0.0",
   inputs: [
     {
       key: "model",
@@ -17,15 +18,17 @@ export const openrouterConfig: NodeConfig = {
       isAdvanced: false,
       description: "The OpenRouter model to use",
       validation: {
+        aliases: OPENROUTER_MODEL_ALIASES,
         options: [
           { label: "Gemini 2.5 Flash", value: "google/gemini-2.5-flash" },
-          { label: "Claude Sonnet 4.5", value: "anthropic/claude-sonnet-4-5" },
+          { label: "Claude Sonnet 4.5", value: "anthropic/claude-sonnet-4.5" },
           { label: "Llama 3 8B Instruct", value: "meta-llama/llama-3-8b-instruct" },
         ],
       },
     },
     {
       key: "system_prompt",
+      validation: { maxLength: BILLING_LIMITS.systemPromptCharacters },
       type: "text",
       label: "System Prompt",
       required: false,
@@ -36,6 +39,7 @@ export const openrouterConfig: NodeConfig = {
     },
     {
       key: "user_message",
+      validation: { maxLength: BILLING_LIMITS.userMessageCharacters },
       type: "text",
       label: "User Message",
       required: true,
@@ -52,7 +56,7 @@ export const openrouterConfig: NodeConfig = {
       isAdvanced: true,
       default: 512,
       description: "Maximum number of tokens to generate",
-      validation: { min: 1, max: 8192 },
+      validation: { min: 1, max: BILLING_LIMITS.outputTokens },
     },
     {
       key: "temperature",
@@ -88,6 +92,7 @@ export const openrouterConfig: NodeConfig = {
     {
       key: "finish_reason",
       type: "text",
+      optional: true,
       label: "Finish Reason",
     },
   ],
@@ -120,12 +125,7 @@ export const openrouterConfig: NodeConfig = {
     },
   ],
   credits: {
-    estimate: (inputs) => {
-      const model = (inputs.model as string) ?? "";
-      const promptLen = (inputs.user_message as string)?.length ?? 500;
-      const ratePerChar = model.includes("claude") ? 5 : 2;
-      return Math.ceil(promptLen * ratePerChar);
-    },
+    estimate: () => estimateNodeReservation("openrouter-llm"),
     calculate: (inputs, response: unknown) => {
       const res = response as { usage?: { prompt_tokens?: number; completion_tokens?: number } } | null;
       const usage = res?.usage;

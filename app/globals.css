@@ -21,6 +21,35 @@
 }
 
 :root {
+  /* Editor layout tokens: preserve the existing palette and control sizes. */
+  --editor-space-1: 0.25rem;
+  --editor-space-2: 0.5rem;
+  --editor-space-3: 0.75rem;
+  --editor-space-4: 1rem;
+  --editor-space-6: 1.5rem;
+  --editor-control-size: 2.25rem;
+  --editor-control-font-size: 0.75rem;
+  --editor-control-radius: 0.5rem;
+  --editor-recovery-message-width: 32rem;
+  --editor-icon-size: 1rem;
+  --editor-logo-size: 1.25rem;
+  --editor-mark-gap: 0.125rem;
+  --editor-mark-padding: 0.1875rem;
+  --editor-mark-radius: 0.0625rem;
+  --editor-palette-width: 16rem;
+  --editor-palette-rail: 4.5rem;
+  --editor-history-width: 20rem;
+  --editor-sidebar-header: 3.75rem;
+  --editor-title-min: 6rem;
+  --editor-title-max: 20rem;
+  --editor-toolbar-layer: 20;
+  --editor-sidebar-layer: 40;
+  --editor-minimap-reserve: 13.5rem;
+  --editor-motion-fast: 150ms;
+  --editor-motion-panel: 300ms;
+  --editor-focus-width: 2px;
+  --editor-focus-offset: 2px;
+
   /* ── DataType Handle Colors (dark mode defaults) ────────────────────── */
   --color-dt-image: #a78bfa;
   --color-dt-video: #fb7185;
@@ -262,7 +291,7 @@ html {
   /* Firefox */
 }
 
-/* ===== Krea-style React Flow Handles ===== */
+/* React Flow ports keep stable measured bounds in every interaction state. */
 .react-flow__handle {
   width: 8px !important;
   height: 8px !important;
@@ -271,7 +300,7 @@ html {
   background-clip: padding-box !important;
   /* Keep background color inside the border */
   border-radius: 50% !important;
-  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  transition: opacity var(--editor-motion-fast), box-shadow var(--editor-motion-fast), border-color var(--editor-motion-fast) !important;
   opacity: 0.85;
   z-index: 50 !important;
   box-sizing: content-box !important;
@@ -280,11 +309,10 @@ html {
 /* Source handles (right side) — completely centered on the right edge */
 .react-flow__handle.react-flow__handle-right {
   right: 0 !important;
-  transform: translate(50%, -50%) scale(1) !important;
+  transform: translate(50%, -50%) !important;
 }
 
 .react-flow__handle.react-flow__handle-right:hover {
-  transform: translate(50%, -50%) scale(1.25) !important;
   opacity: 1;
   border-color: #18181b !important;
 }
@@ -292,11 +320,10 @@ html {
 /* Target handles (left side) — completely centered on the left edge */
 .react-flow__handle.react-flow__handle-left {
   left: 0 !important;
-  transform: translate(-50%, -50%) scale(1) !important;
+  transform: translate(-50%, -50%) !important;
 }
 
 .react-flow__handle.react-flow__handle-left:hover {
-  transform: translate(-50%, -50%) scale(1.1) !important;
   opacity: 1;
   border-color: #18181b !important;
 }
@@ -309,35 +336,30 @@ html {
 /* ── Valid target while dragging — emerald glow ring ─────────────────── */
 .react-flow__handle-valid {
   box-shadow: 0 0 0 3px var(--color-valid-ring, #34d399) !important;
-  transform: translate(var(--handle-tx, -50%), -50%) scale(1.3) !important;
-  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  transition: opacity var(--editor-motion-fast), box-shadow var(--editor-motion-fast), border-color var(--editor-motion-fast) !important;
 }
 
 /* ── Invalid target while dragging — rose red, no ambiguity ──────────── */
 .react-flow__handle-invalid {
   box-shadow: 0 0 0 3px var(--color-invalid-ring, #f43f5e) !important;
   background-color: #f43f5e !important;
-  transform: translate(var(--handle-tx, -50%), -50%) scale(1.2) !important;
-  transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
+  transition: opacity var(--editor-motion-fast), box-shadow var(--editor-motion-fast), border-color var(--editor-motion-fast) !important;
 }
 
-/* ── Connecting state — pulse the source handle ──────────────────────── */
+/* Connecting state uses glow without moving or scaling measured ports. */
 .react-flow__handle-connecting {
   box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.15) !important;
-  transform: translate(var(--handle-tx, -50%), -50%) scale(1.4) !important;
 }
 
 /* ── Legacy connecting classes (React Flow internal) ─────────────────── */
 .react-flow__handle.react-flow__handle-right.connectingto,
 .react-flow__handle.react-flow__handle-right.connectingfrom {
-  transform: translate(50%, -50%) scale(1.4) !important;
   opacity: 1;
   border-color: #18181b !important;
 }
 
 .react-flow__handle.react-flow__handle-left.connectingto,
 .react-flow__handle.react-flow__handle-left.connectingfrom {
-  transform: translate(-50%, -50%) scale(1.4) !important;
   opacity: 1;
   border-color: #18181b !important;
 }
@@ -373,6 +395,249 @@ html {
 
 .animate-fade-in {
   animation: fade-in 0.3s ease-out forwards;
+}
+
+/* Shared editor shell. Layout values belong here, not in individual controls. */
+.editor-workspace {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+  position: relative;
+  container: editor / inline-size;
+}
+
+.editor-titlebar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--editor-space-2);
+  padding: var(--editor-space-4);
+  position: relative;
+  z-index: var(--editor-toolbar-layer);
+  flex-shrink: 0;
+}
+
+.editor-identity {
+  display: flex;
+  align-items: center;
+  gap: var(--editor-space-2);
+  flex: 1 1 var(--editor-title-max);
+  min-width: 0;
+}
+
+.editor-identity > a,
+.editor-identity > span {
+  flex-shrink: 0;
+}
+
+.editor-name-surface {
+  min-width: 0;
+  max-width: var(--editor-title-max);
+}
+
+.editor-name-button {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: start;
+}
+
+.editor-name-input {
+  min-width: 0;
+  width: clamp(var(--editor-title-min), 100%, var(--editor-title-max));
+}
+
+.editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--editor-space-2);
+  margin-inline-start: auto;
+  min-width: 0;
+}
+
+.editor-actions > button,
+.editor-actions > div {
+  flex-shrink: 0;
+}
+
+.editor-palette {
+  flex: 0 0 var(--editor-palette-width);
+  width: var(--editor-palette-width);
+  min-width: 0;
+  transition: width var(--editor-motion-panel) ease, flex-basis var(--editor-motion-panel) ease;
+}
+
+.editor-palette[data-expanded="false"] {
+  flex-basis: var(--editor-palette-rail);
+  width: var(--editor-palette-rail);
+}
+
+.editor-palette-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-inline: var(--editor-space-4);
+  min-height: var(--editor-sidebar-header);
+  flex-shrink: 0;
+}
+
+.editor-palette[data-expanded="false"] .editor-palette-header {
+  justify-content: center;
+  padding-inline: 0;
+}
+
+.editor-palette-annotation {
+  padding-top: var(--editor-space-3);
+}
+
+.editor-palette-mark {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--editor-mark-gap);
+  width: var(--editor-logo-size);
+  height: var(--editor-logo-size);
+  padding: var(--editor-mark-padding);
+}
+
+.editor-palette-mark > i {
+  background: var(--text-muted);
+  border-radius: var(--editor-mark-radius);
+}
+
+.editor-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: var(--editor-control-size);
+  height: var(--editor-control-size);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  transition: color var(--editor-motion-fast), background-color var(--editor-motion-fast);
+}
+
+.editor-icon-button:hover {
+  background: var(--sidebar-item-hover);
+  color: var(--text-primary);
+}
+
+.editor-icon-button > svg {
+  width: var(--editor-icon-size);
+  height: var(--editor-icon-size);
+}
+
+.editor-layout :is(button, a, input):focus-visible {
+  outline: var(--editor-focus-width) solid var(--node-selected-border);
+  outline-offset: var(--editor-focus-offset);
+}
+
+.editor-history {
+  flex: 0 0 var(--editor-history-width);
+  width: var(--editor-history-width);
+  min-width: 0;
+}
+
+.editor-history[hidden] {
+  display: none;
+}
+
+.editor-control-dock {
+  position: absolute;
+  inset-inline: var(--editor-space-6);
+  bottom: var(--editor-space-6);
+  z-index: var(--editor-toolbar-layer);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--editor-space-4);
+  padding-inline-end: var(--editor-minimap-reserve);
+  pointer-events: none;
+}
+
+.editor-control-dock > * {
+  pointer-events: auto;
+}
+
+.editor-view-controls {
+  flex-shrink: 0;
+}
+
+.editor-execution-controls,
+.editor-run-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--editor-space-4);
+  max-width: 100%;
+}
+
+.editor-execution-controls {
+  margin-inline: auto;
+}
+
+.editor-run-actions {
+  gap: var(--editor-space-2);
+}
+
+@container editor (max-width: 48rem) {
+  .editor-action-label {
+    display: none;
+  }
+
+  .editor-control-dock {
+    inset-inline: var(--editor-space-4);
+    bottom: var(--editor-space-4);
+    padding-inline-end: 0;
+    justify-content: center;
+  }
+
+  .editor-canvas .react-flow__minimap {
+    display: none;
+  }
+}
+
+/* History overlays the canvas before two sidebars can squeeze it shut. */
+@media (max-width: 1023px) {
+  .editor-history {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-end: 0;
+    z-index: var(--editor-sidebar-layer);
+    max-width: calc(100% - var(--editor-palette-rail));
+  }
+}
+
+/* Matches EDITOR_UI.compactViewport; a compact palette overlays its rail. */
+@media (max-width: 767px) {
+  .editor-layout {
+    padding-inline-start: var(--editor-palette-rail);
+  }
+
+  .editor-palette {
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    z-index: var(--editor-sidebar-layer);
+    max-width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .editor-palette,
+  .editor-layout :is(button, a) {
+    transition: none;
+  }
+
+  .editor-layout .animate-node-pulse,
+  .editor-layout .react-flow__edge-path {
+    animation: none;
+  }
 }
 
 @theme inline {
@@ -590,3 +855,28 @@ html {
     @apply font-sans;
   }
 }
+
+.editor-save-recovery {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--editor-space-3);
+  padding: var(--editor-space-3);
+  color: var(--text-primary);
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--panel-border);
+  font-size: var(--editor-control-font-size);
+  flex-shrink: 0;
+}
+.editor-save-recovery p { flex: 1 1 min(100%, var(--editor-recovery-message-width)); min-width: 0; }
+.editor-save-recovery-actions { display: flex; flex-wrap: wrap; gap: var(--editor-space-2); }
+.editor-save-recovery-actions button {
+  padding: var(--editor-space-2) var(--editor-space-3);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--editor-control-radius);
+  background: var(--panel-bg);
+}
+.editor-save-recovery-actions button:hover { background: var(--sidebar-item-hover); }
+
+.editor-rename-recovery { margin-top: var(--editor-space-2); color: var(--text-secondary); font-size: var(--editor-control-font-size); }
+.editor-rename-recovery button { margin-top: var(--editor-space-2); text-decoration: underline; color: var(--text-primary); }

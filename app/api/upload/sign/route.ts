@@ -1,72 +1,34 @@
-import { NextResponse } from 'next/server';
-import crypto from 'crypto';
+import { z } from "zod";
+import { authorizeUpload, signUpload } from "@/lib/upload-policy";
+import { readBoundedBody, RequestBodyError } from "@/lib/request-body";
+import { transloaditUrl } from "@/lib/transloadit-url";
+import { MAX_UPLOAD_BYTES } from "@/lib/upload-policy";
+
+const signingInput = z.object({ type: z.enum(["image", "video"]), size: z.number().int().positive().max(MAX_UPLOAD_BYTES) }).strict();
+const assemblySchema = z.object({ assembly_ssl_url: z.string().url(), tus_url: z.string().url() });
 
 export async function POST(request: Request) {
+  const denied = await authorizeUpload();
+  if (denied) return denied;
   try {
-    const body = await request.json();
-    const { templateId, type } = body;
-
-    const authKey = process.env.NEXT_PUBLIC_TRANSLOADIT_AUTH_KEY;
-    const authSecret = process.env.TRANSLOADIT_AUTH_SECRET;
-
-    if (!authKey || !authSecret) {
-      return NextResponse.json({ error: 'Server configuration error' }, { status: 500 });
-    }
-
-    // Set expiry 1 hour from now (matching Transloadit SDK format)
-    const expires = new Date();
-    expires.setHours(expires.getHours() + 1);
-    const expiresString = expires.toISOString();
-
-    const params: any = {
-      auth: {
-        key: authKey,
-        expires: expiresString
-      }
-    };
-
-    if (templateId) {
-      params.template_id = templateId;
-    } else {
-      if (type === 'image') {
-        params.steps = {
-          image_exported: {
-            use: ":original",
-            robot: "/image/resize",
-            resize_strategy: "fit",
-            width: 1920,
-            height: 1080,
-            result: true
-          }
-        };
-      } else {
-        params.steps = {
-          video_exported: {
-            use: ":original",
-            robot: "/file/filter",
-            result: true
-          }
-        };
-      }
-    }
-
-    const paramsString = JSON.stringify(params);
-
-    // Calculate signature using HMAC-SHA384 (Transloadit v3 standard)
-    // Transloadit expects the signature to be hex encoded and prefixed with the algorithm
-    const digest = crypto
-      .createHmac('sha384', authSecret)
-      .update(Buffer.from(paramsString, 'utf-8'))
-      .digest('hex');
-      
-    const signature = `sha384:${digest}`;
-
-    return NextResponse.json({
-      params: paramsString,
-      signature
-    });
-  } catch (error: any) {
-    console.error('Signature generation error:', error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    const parsed = signingInput.safeParse(JSON.parse((await readBoundedBody(request, 1024)).toString("utf8")));
+    if (!parsed.success) return Response.json({ error: "Choose image or video upload" }, { status: 400 });
+    const steps = parsed.data.type === "image"
+      ? { image_exported: { use: ":original", robot: "/image/resize", resize_strategy: "fit", width: 1920, height: 1080, result: true } }
+      : { video_exported: { use: ":original", robot: "/file/filter", accepts: [["${file.mime}", "regex", "^video/"]], error_on_decline: true, result: true } };
+    // Create one assembly here: never expose reusable assembly-creation credentials.
+    const signed = signUpload(steps);
+    const form = new FormData();
+    form.set("params", signed.params);
+    form.set("signature", signed.signature);
+    form.set("num_expected_upload_files", "1");
+    const response = await fetch("https://api2.transloadit.com/assemblies", { method: "POST", body: form, redirect: "error", signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) throw new Error("Upload provider unavailable");
+    const assembly = assemblySchema.parse(JSON.parse((await readBoundedBody(response, 1024 * 1024)).toString("utf8")));
+    return Response.json({ assemblyUrl: transloaditUrl(assembly.assembly_ssl_url), tusUrl: transloaditUrl(assembly.tus_url) }, { headers: { "Cache-Control": "no-store" } });
+  } catch (error) {
+    if (error instanceof RequestBodyError) return Response.json({ error: error.message }, { status: error.status });
+    if (error instanceof SyntaxError) return Response.json({ error: "Invalid JSON" }, { status: 400 });
+    return Response.json({ error: "Uploads are temporarily unavailable" }, { status: 503 });
   }
 }

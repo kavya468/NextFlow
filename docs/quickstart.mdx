@@ -1,58 +1,41 @@
 ---
 title: "Quickstart"
-description: "Start generating content programmatically in minutes"
+description: "Execute a saved workflow and inspect its results."
 ---
 
-Follow these steps to trigger your first NextFlow workflow from the API.
+Create and save a workflow in the editor. A Text-to-Text connection is a useful first check because it requires no paid provider. The application still needs a running Trigger.dev worker.
 
-### Step 1: Get an API key
+## Find your workflow
 
-Head to **Settings → API Keys** and click **Generate Key**.
-
-### Step 2: List your workflows
-
-Find the ID of the workflow you want to execute by calling the List Workflows endpoint.
+Configure the environment variables described in [authentication](/authentication), then list your workflows:
 
 ```bash
-curl -X GET "https://api.nextflow.app/v1/workflows" \
-  -H "Authorization: Bearer nf_YOUR_API_KEY"
+curl "$NEXTFLOW_ORIGIN/api/v1/workflows" \
+  -H "Authorization: Bearer $NEXTFLOW_API_KEY"
 ```
 
-### Step 3: Execute a workflow
+Set `WORKFLOW_ID` to a returned ID. Fetch `/api/v1/workflows/$WORKFLOW_ID` to inspect node IDs, labels, and exposed input fields.
 
-Once you have your workflow ID, execute it.
+## Execute the saved graph
 
 ```bash
-curl -X POST "https://api.nextflow.app/v1/workflows/123e4567-e89b-12d3.../execute" \
-  -H "Authorization: Bearer nf_YOUR_API_KEY" \
+curl -X POST "$NEXTFLOW_ORIGIN/api/v1/workflows/$WORKFLOW_ID/execute" \
+  -H "Authorization: Bearer $NEXTFLOW_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"inputs": {"node-id": {"prompt": "A futuristic city in cyberpunk style"}}}'
+  -d '{"idempotencyKey":"first-text-run-001"}'
 ```
 
-Using TypeScript `fetch`:
+The response includes `runId`, `workflowId`, `scope`, `nodeCount`, `estimatedCredits`, and `status`. `estimatedCredits` is the maximum reservation, not the final charge. Reuse the same idempotency key and request body when retrying an uncertain response; use a new key for an intentionally new run.
 
-```typescript
-const response = await fetch("https://api.nextflow.app/v1/workflows/123e4567.../execute", {
-  method: "POST",
-  headers: {
-    "Authorization": "Bearer nf_YOUR_API_KEY",
-    "Content-Type": "application/json"
-  },
-  body: JSON.stringify({
-    inputs: {
-      "promptNode": { prompt: "A futuristic city in cyberpunk style" }
-    }
-  })
-});
-const data = await response.json();
-console.log("Execution ID:", data.runId);
-```
+To supply runtime values, use `inputs` keyed by internal node ID or `variables` for exposed inputs keyed by label. See [execute workflow](/api-reference/workflows/execute) for the payload contract.
 
-### Step 4: Poll execution status
+## Inspect the result
 
-The execute endpoint kicks off the pipeline asynchronously. You can use the returned `runId` to poll for its status.
+Set `RUN_ID` to the returned run ID:
 
 ```bash
-curl -X GET "https://api.nextflow.app/v1/executions/{runId}" \
-  -H "Authorization: Bearer nf_YOUR_API_KEY"
+curl "$NEXTFLOW_ORIGIN/api/v1/executions/$RUN_ID" \
+  -H "Authorization: Bearer $NEXTFLOW_API_KEY"
 ```
+
+A completed successful run has status `SUCCESS`. Inspect `nodeRuns[].inputs` and `nodeRuns[].outputs` to verify what each node received and produced. `DISPATCH_UNKNOWN` means the start is unconfirmed; it does not mean the run is safe to repeat with a new key. The editor's recovery action checks uncertain runs without creating another reservation.

@@ -1,219 +1,70 @@
-// ============================================================================
-// app/api/upload/route.ts — Media Upload via Transloadit REST API
-// ============================================================================
-//
-// Accepts multipart/form-data with a single "file" field, uploads it to
-// Transloadit for processing, polls until completion, and returns:
-//   { url: "https://cdn-url..." }
-//
-// ARCHITECTURAL NOTE:
-//   This uses the raw Transloadit REST API (not the Node.js SDK) to avoid
-//   SDK compatibility issues inside Next.js API routes. This is the exact
-//   same battle-tested pattern used in src/trigger/media.ts.
-// ============================================================================
+import { z } from "zod";
+import { authorizeUpload, MAX_UPLOAD_BYTES, signUpload } from "@/lib/upload-policy";
+import { readBoundedBody, RequestBodyError } from "@/lib/request-body";
 
-import { NextResponse } from 'next/server';
-import crypto from 'crypto';
+export const maxDuration = 120;
+const fileResult = z.object({ ssl_url: z.string().url() });
+const assemblySchema = z.object({
+  ok: z.string().optional(), error: z.string().optional(), assembly_ssl_url: z.string().url().optional(),
+  results: z.record(z.string(), z.array(fileResult)).optional(), uploads: z.array(fileResult).optional(),
+});
+const mediaType = /^(image\/(jpeg|png|webp|gif|avif|heic|heif)|video\/(mp4|webm|quicktime|mpeg|ogg)|audio\/(mpeg|mp3|wav|x-wav|wave|mp4|aac|ogg|webm|flac|x-flac|x-m4a))$/;
 
-// ---------------------------------------------------------------------------
-// Route Segment Config — raise body size limit for video uploads (default 4MB)
-// ---------------------------------------------------------------------------
-export const maxDuration = 120; // seconds — video upload + Transloadit polling
-
-
-// ---------------------------------------------------------------------------
-// Transloadit helpers — identical to src/trigger/media.ts
-// ---------------------------------------------------------------------------
-
-function createTransloaditParams(
-  authKey: string,
-  authSecret: string,
-  steps: Record<string, unknown>
-) {
-  const params = {
-    auth: {
-      key: authKey,
-      expires:
-        new Date(Date.now() + 1000 * 60 * 30)
-          .toISOString()
-          .replace("T", " ")
-          .slice(0, 19) + "+00:00",
-    },
-    steps,
-  };
-
-  const paramsString = JSON.stringify(params);
-  const signature = crypto
-    .createHmac("sha384", authSecret)
-    .update(paramsString)
-    .digest("hex");
-
-  return { params: paramsString, signature: `sha384:${signature}` };
-}
-
-async function pollAssembly(
-  assemblyUrl: string,
-  maxWait = 120000
-): Promise<any> {
-  const start = Date.now();
-  while (Date.now() - start < maxWait) {
-    const res = await fetch(assemblyUrl);
-    const data = await res.json();
-
-    if (data.ok === "ASSEMBLY_COMPLETED") {
-      return data;
-    }
-    if (data.error) {
-      throw new Error(`Transloadit assembly error: ${data.error}`);
-    }
-
-    // Poll every 2 seconds
-    await new Promise((r) => setTimeout(r, 2000));
+async function pollAssembly(assemblyUrl: string, signal: AbortSignal) {
+  const url = new URL(assemblyUrl);
+  if (url.protocol !== "https:" || url.username || url.password || url.port ||
+      !(url.hostname === "api2.transloadit.com" || url.hostname.endsWith(".transloadit.com"))) {
+    throw new Error("Unexpected upload status URL");
   }
-  throw new Error("Transloadit assembly timed out after 120s");
+  while (true) {
+    const response = await fetch(url, { signal, redirect: "error" });
+    if (!response.ok) throw new Error("Upload status unavailable");
+    const data = assemblySchema.parse(await response.json());
+    if (data.error) throw new Error("Upload processing failed");
+    if (data.ok === "ASSEMBLY_COMPLETED") return data;
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    signal.throwIfAborted();
+  }
 }
-
-// ---------------------------------------------------------------------------
-// POST handler — accepts FormData with "file" field
-// ---------------------------------------------------------------------------
 
 export async function POST(request: Request) {
+  const denied = await authorizeUpload();
+  if (denied) return denied;
   try {
-    // ── 1. Extract file from FormData ─────────────────────────────────────
-    let formData: FormData;
+    const bytes = await readBoundedBody(request, MAX_UPLOAD_BYTES + 64 * 1024);
+    let form: FormData;
     try {
-      formData = await request.formData();
-    } catch (parseError: any) {
-      console.error("[upload/route] Failed to parse FormData:", parseError);
-      return NextResponse.json(
-        {
-          error:
-            "Failed to parse upload. The file may be too large (max ~50MB) or the request was interrupted. " +
-            "Try a smaller file or paste a URL instead.",
-        },
-        { status: 413 }
-      );
+      form = await new Response(new Uint8Array(bytes), { headers: { "Content-Type": request.headers.get("content-type") ?? "" } }).formData();
+    } catch {
+      return Response.json({ error: "Invalid multipart upload" }, { status: 400 });
     }
-    const file = formData.get("file") as File;
-
-    if (!file) {
-      return NextResponse.json(
-        { error: "No file provided" },
-        { status: 400 }
-      );
+    const file = form.get("file");
+    if (!(file instanceof File) || Array.from(form.values()).filter((value) => value instanceof File).length !== 1 || !mediaType.test(file.type) || file.size === 0) {
+      return Response.json({ error: "Upload one supported image, video, or audio file" }, { status: 400 });
     }
-
-    // ── 2. Validate env keys ──────────────────────────────────────────────
-    const authKey = process.env.NEXT_PUBLIC_TRANSLOADIT_AUTH_KEY;
-    const authSecret = process.env.TRANSLOADIT_AUTH_SECRET;
-
-    if (!authKey || !authSecret) {
-      console.error(
-        "[upload/route] NEXT_PUBLIC_TRANSLOADIT_AUTH_KEY or TRANSLOADIT_AUTH_SECRET is missing from .env"
-      );
-      return NextResponse.json(
-        {
-          error:
-            "Server configuration error: Transloadit API keys are not set. " +
-            "Add NEXT_PUBLIC_TRANSLOADIT_AUTH_KEY and TRANSLOADIT_AUTH_SECRET to your .env file.",
-        },
-        { status: 500 }
-      );
-    }
-
-    // ── 3. Build Transloadit assembly steps ───────────────────────────────
-    const isVideo = file.type.startsWith("video/");
-
-    const steps = isVideo
-      ? {
-          ":original": { robot: "/upload/handle" },
-        }
-      : {
-          ":original": { robot: "/upload/handle" },
-          resized: {
-            robot: "/image/resize",
-            use: ":original",
-            resize_strategy: "fit",
-            width: 1920,
-            height: 1080,
-            result: true,
-          },
-        };
-
-    // ── 4. Create signed assembly request ─────────────────────────────────
-    const { params, signature } = createTransloaditParams(
-      authKey,
-      authSecret,
-      steps
-    );
-
+    if (file.size > MAX_UPLOAD_BYTES) return Response.json({ error: "Maximum file size is 50 MB" }, { status: 413 });
+    const isImage = file.type.startsWith("image/");
+    const steps = {
+      ":original": { robot: "/upload/handle" },
+      validated: { use: ":original", robot: "/file/filter", accepts: [["${file.mime}", "regex", "^(image|video|audio)/"]], error_on_decline: true },
+      ...(isImage ? { resized: { robot: "/image/resize", use: "validated", resize_strategy: "fit", width: 1920, height: 1080, result: true } } : {}),
+    };
+    const signed = signUpload(steps);
     const uploadForm = new FormData();
-    uploadForm.append("params", params);
-    uploadForm.append("signature", signature);
+    uploadForm.append("params", signed.params);
+    uploadForm.append("signature", signed.signature);
     uploadForm.append("file", file, file.name);
-
-    console.log("[upload/route] Creating Transloadit assembly...", {
-      fileName: file.name,
-      fileSize: file.size,
-      fileType: file.type,
-      isVideo,
-    });
-
-    // ── 5. POST to Transloadit assemblies endpoint ────────────────────────
-    const assemblyRes = await fetch(
-      "https://api2.transloadit.com/assemblies",
-      {
-        method: "POST",
-        body: uploadForm,
-      }
-    );
-
-    const assembly = await assemblyRes.json();
-
-    if (assembly.error) {
-      console.error("[upload/route] Assembly creation failed:", assembly.error);
-      throw new Error(`Transloadit: ${assembly.error}`);
-    }
-
-    console.log("[upload/route] Assembly created, polling for completion...", {
-      assemblyId: assembly.assembly_id,
-      assemblyUrl: assembly.assembly_ssl_url,
-    });
-
-    // ── 6. Poll until the assembly finishes processing ────────────────────
-    const result = await pollAssembly(assembly.assembly_ssl_url);
-
-    // ── 7. Extract the CDN URL from results ───────────────────────────────
-    const stepKey = isVideo ? ":original" : "resized";
-    const stepResults = result.results?.[stepKey];
-
-    if (stepResults?.[0]?.ssl_url) {
-      const cdnUrl = stepResults[0].ssl_url;
-      console.log("[upload/route] Upload complete:", cdnUrl);
-      return NextResponse.json({ url: cdnUrl });
-    }
-
-    // Fallback: use the original upload URL if no processing step produced output
-    if (result.uploads?.[0]?.ssl_url) {
-      const fallbackUrl = result.uploads[0].ssl_url;
-      console.log("[upload/route] Using fallback upload URL:", fallbackUrl);
-      return NextResponse.json({ url: fallbackUrl });
-    }
-
-    // Should never reach here if Transloadit is configured correctly
-    console.error(
-      "[upload/route] Assembly completed but no URL found in results:",
-      JSON.stringify(result.results, null, 2)
-    );
-    return NextResponse.json(
-      { error: "Upload processed but no CDN URL was returned by Transloadit" },
-      { status: 500 }
-    );
-  } catch (error: any) {
-    console.error("[upload/route] Upload failed:", error);
-    return NextResponse.json(
-      { error: error.message || "Unknown upload error" },
-      { status: 500 }
-    );
+    const signal = AbortSignal.timeout(90_000);
+    const response = await fetch("https://api2.transloadit.com/assemblies", { method: "POST", body: uploadForm, signal, redirect: "error" });
+    if (!response.ok) throw new Error("Upload provider unavailable");
+    const assembly = assemblySchema.parse(await response.json());
+    if (assembly.error || !assembly.assembly_ssl_url) throw new Error("Upload was rejected");
+    const result = await pollAssembly(assembly.assembly_ssl_url, signal);
+    const url = result.results?.[isImage ? "resized" : ":original"]?.[0]?.ssl_url ?? result.uploads?.[0]?.ssl_url;
+    if (!url || new URL(url).protocol !== "https:") throw new Error("Upload has no secure result URL");
+    return Response.json({ url });
+  } catch (error) {
+    if (error instanceof RequestBodyError) return Response.json({ error: error.message }, { status: error.status });
+    return Response.json({ error: "Upload failed. Please try again." }, { status: 502 });
   }
 }

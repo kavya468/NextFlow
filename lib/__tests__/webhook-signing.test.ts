@@ -3,10 +3,20 @@ import {
   signToken,
   verifyWebhookSignature,
   buildWebhookUrl,
+  assertFalRequestId,
 } from "../webhook-signing";
 
 const TEST_SECRET = "test-webhook-secret-key-for-hmac-signing";
 const TEST_APP_URL = "https://my-app.ngrok.dev";
+
+describe("provider request correlation", () => {
+  it.each([null, {}, { request_id: "another-job" }, { request_id: 42 }])("rejects a callback for the wrong request: %j", (payload) => {
+    expect(() => assertFalRequestId(payload, "queued-job")).toThrow("does not match");
+  });
+  it.each(["OK", "ERROR"])("accepts a matching %s callback even when the gateway attempt ID differs", (status) => {
+    expect(() => assertFalRequestId({ request_id: "queued-job", gateway_request_id: "retry-attempt", status }, "queued-job")).not.toThrow();
+  });
+});
 
 beforeEach(() => {
   vi.stubEnv("FAL_WEBHOOK_SECRET", TEST_SECRET);

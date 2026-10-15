@@ -1,18 +1,12 @@
 ---
 title: "Introduction"
-description: "Welcome to the NextFlow Documentation"
+description: "Build and run connected media workflows with NextFlow."
 ---
 
-NextFlow is an advanced AI generation platform designed to let you build powerful image, video, and audio pipelines through a visual workflow builder and an intuitive API.
+NextFlow connects text, image, audio, and video tools in a visual graph. Save a workflow in the editor, then use the API to supply runtime inputs, execute it, and inspect each step's result.
 
-## What you can build with the API
+The API supports workflow discovery, full or selected-node execution, run status, and credit balance. The HTTP MCP endpoint also exposes graph editing tools. See the [repository README](https://github.com/kavya468/NextFlow) for local setup and current release limitations.
 
-The NextFlow API provides full programmatic access to all generation capabilities:
+Paid execution reserves a maximum credit amount before dispatch. A failed dependency blocks its downstream steps; an uncertain provider result retains its credit hold for reconciliation.
 
-- **Image Pipelines**: Trigger multi-stage generation, enhancement, and outpainting logic.
-- **Video Pipelines**: Automate FFmpeg rendering and video concatenation dynamically.
-- **Audio & TTS**: Chain text-to-speech providers like ElevenLabs inside larger workflows.
-
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  Get up and running with the NextFlow API in 5 minutes
-</Card>
+Start with [authentication](/authentication), then follow the [quickstart](/quickstart). Examples describe the source in this repository; an older hosted deployment may expose a different contract.

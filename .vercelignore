@@ -5,6 +5,7 @@ antigravity-skills/
 .gemini/
 .planning/
 .ruler/
+prototypes/
 
 # Build artifacts
 dist/
@@ -17,4 +18,3 @@ docs/
 
 # Misc
 .DS_Store
-*.sql

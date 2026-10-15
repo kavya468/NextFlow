@@ -13,13 +13,16 @@ import {
   ExecutionNotFoundError,
   ValidationError,
   OwnershipError,
-  DuplicateLabelError,
+  WorkflowConflictError,
 } from "@/lib/services/errors";
-import { estimateWorkflowCost, reserveCredits } from "@/lib/credits/credit-service";
+import { estimateWorkflowCost, reserveCredits, finalizeRun } from "@/lib/credits/credit-service";
 import { nodeRegistry } from "@/lib/nodes/registry";
 import "@/lib/nodes/configs"; // side-effect: register all node configs
-import { getExposedInputs, deduplicatePassthroughLabels } from "@/lib/nodes/exposed-inputs";
-import { tasks } from "@trigger.dev/sdk/v3";
+import { getExposedInputs } from "@/lib/nodes/exposed-inputs";
+import { tasks } from "@trigger.dev/sdk";
+import { Prisma, type Run } from "@prisma/client";
+import { createHash } from "node:crypto";
+import { prepareExecutionGraph } from "./execution-graph";
 
 // ── 1. createWorkflow ──────────────────────────────────────────────────────
 
@@ -40,8 +43,8 @@ export async function createWorkflow(
       userId,
       name,
       description: description ?? null,
-      nodes: [] as any,
-      edges: [] as any,
+      nodes: [],
+      edges: [],
     },
   });
 
@@ -110,213 +113,156 @@ export async function getWorkflowByName(userId: string, name: string) {
 // ── 4. executeWorkflow ─────────────────────────────────────────────────────
 
 export interface ExecuteWorkflowOptions {
-  /** Input value overrides for parameterized runs (label → value map). */
   inputValues?: Record<string, unknown>;
-  /** Subset of node IDs to execute (enables PARTIAL / SINGLE scope). */
   selectedNodeIds?: string[];
-  /** Override the workflow's stored nodes (e.g. unsaved canvas state). */
-  nodesOverride?: any[];
-  /** Override the workflow's stored edges (e.g. unsaved canvas state). */
-  edgesOverride?: any[];
-  /** Skip ownership check — used when a consumer runs a published template. */
+  nodesOverride?: unknown[];
+  edgesOverride?: unknown[];
   skipOwnershipCheck?: boolean;
-  /** Webhook URL to call upon completion. */
   webhookUrl?: string;
+  requestKey?: string;
+  saveCanvas?: boolean;
+  expectedRevision?: number;
 }
 
-export async function executeWorkflow(
-  userId: string,
-  workflowId: string,
-  options?: ExecuteWorkflowOptions,
-) {
-  const {
-    inputValues,
-    selectedNodeIds,
-    nodesOverride,
-    edgesOverride,
-    skipOwnershipCheck = false,
-    webhookUrl,
-  } = options ?? {};
+type RunSnapshot = ReturnType<typeof prepareExecutionGraph> & {
+  estimates: Awaited<ReturnType<typeof estimateWorkflowCost>>;
+  inputValues?: Record<string, unknown>;
+  webhookUrl?: string;
+  contractVersion: number;
+  nodeVersions: Record<string, string>;
+  providers: Record<string, Array<{ id: string; endpoints: Array<{ id: string; taskId: string }> }>>;
+};
 
-  // Ensure the User row exists (Clerk users may not have a DB row yet)
-  await prisma.user.upsert({
-    where: { id: userId },
-    update: {},
-    create: { id: userId },
-  });
+function requestFingerprint(value: unknown): string {
+  const canonical = (item: unknown): unknown => Array.isArray(item) ? item.map(canonical)
+    : item && typeof item === "object" ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)).map(([key, val]) => [key, canonical(val)])) : item;
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
+}
 
-  // Load workflow & verify ownership
-  const workflow = await prisma.workflow.findUnique({
-    where: { id: workflowId },
-  });
+export async function executeWorkflow(userId: string, workflowId: string, options: ExecuteWorkflowOptions = {}) {
+  const { requestKey, ...request } = options;
+  if (requestKey !== undefined && (!requestKey.length || requestKey.length > 128)) throw new ValidationError("Idempotency key must contain 1–128 characters");
+  const requestHash = requestFingerprint({ workflowId, ...request });
+  await prisma.user.upsert({ where: { id: userId }, create: { id: userId }, update: {} });
 
-  if (!workflow) {
-    throw new WorkflowNotFoundError(workflowId);
-  }
-  if (!skipOwnershipCheck && workflow.userId !== userId) {
-    throw new OwnershipError();
-  }
-
-  // Use overrides if provided (unsaved canvas / tRPC), else read from DB
-  const allNodes = (nodesOverride ?? workflow.nodes) as any[];
-  const allEdges = (edgesOverride ?? workflow.edges) as any[];
-
-  // Filter out note nodes — they're visual-only, never executed
-  let execNodes = allNodes.filter((n: any) => n.type !== "note");
-  let execEdges = allEdges;
-
-  // ── Partial / Single Scope Resolution ─────────────────────────────
-  // When selectedNodeIds is provided, gather upstream dependencies via
-  // BFS so that all required inputs are executed. This logic was
-  // previously duplicated in the tRPC router.
-  let scope = "FULL";
-  if (selectedNodeIds && selectedNodeIds.length > 0) {
-    scope = selectedNodeIds.length === 1 ? "SINGLE" : "PARTIAL";
-    const selectedSet = new Set<string>(selectedNodeIds);
-    const visited = new Set<string>();
-
-    function gatherUpstream(nodeId: string) {
-      if (visited.has(nodeId)) return;
-      visited.add(nodeId);
-      selectedSet.add(nodeId);
-      for (const edge of allEdges) {
-        if (edge.target === nodeId) {
-          gatherUpstream(edge.source);
-        }
+  const run = await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
+    if (requestKey) {
+      const existing = await tx.run.findUnique({ where: { userId_requestKey: { userId, requestKey } } });
+      if (existing) {
+        if (existing.requestHash !== requestHash) throw new ValidationError("This idempotency key belongs to a different execution request");
+        return existing;
       }
     }
-    for (const nid of selectedNodeIds) gatherUpstream(nid);
-
-    execNodes = execNodes.filter((n: any) => selectedSet.has(n.id));
-    execEdges = allEdges.filter(
-      (e: any) => selectedSet.has(e.source) && selectedSet.has(e.target),
-    );
-  }
-
-  // ── Zero-Trust Node Input Validation ──────────────────────────────
-  // Uses .partial() because required fields may be wired from upstream
-  // edges at runtime — we only validate the TYPES of values the client
-  // actually provided.
-  const validationErrors: string[] = [];
-  for (const node of execNodes) {
-    if (!node.type) {
-      validationErrors.push(`Node "${node.id}": missing type`);
-      continue;
+    if (workflowId) await tx.$queryRaw`SELECT "id" FROM "Workflow" WHERE "id" = ${workflowId} FOR UPDATE`;
+    let workflow = workflowId ? await tx.workflow.findUnique({ where: { id: workflowId } }) : null;
+    if (!workflow && workflowId) throw new WorkflowNotFoundError(workflowId);
+    if (workflow && workflow.userId !== userId && !(options.skipOwnershipCheck && workflow.visibility === "published")) throw new OwnershipError();
+    if (workflow && options.saveCanvas && options.expectedRevision === undefined) throw new ValidationError("An expected revision is required before saving an existing workflow");
+    if (workflow && options.expectedRevision !== undefined && workflow.revision !== options.expectedRevision) throw new WorkflowConflictError();
+    if (!workflow) {
+      if (!options.saveCanvas || !options.nodesOverride || !options.edgesOverride) throw new WorkflowNotFoundError(workflowId);
+      workflow = await tx.workflow.create({ data: { userId, name: "Untitled Workflow", nodes: options.nodesOverride as Prisma.InputJsonValue, edges: options.edgesOverride as Prisma.InputJsonValue } });
+    } else if (options.saveCanvas) {
+      if (workflow.userId !== userId) throw new OwnershipError();
+      workflow = await tx.workflow.update({ where: { id: workflow.id, userId }, data: {
+        nodes: options.nodesOverride as Prisma.InputJsonValue,
+        edges: options.edgesOverride as Prisma.InputJsonValue,
+        revision: { increment: 1 },
+      } });
     }
-    if (!nodeRegistry.has(node.type)) {
-      validationErrors.push(`Node "${node.id}": unknown type "${node.type}"`);
-      continue;
-    }
-    const schema = nodeRegistry.getInputSchema(node.type);
-    const result = schema.partial().safeParse(node.data ?? {});
-    if (!result.success) {
-      const issues = result.error.issues
-        .map((iss: any) => `${iss.path.join(".")}: ${iss.message}`)
-        .join("; ");
-      validationErrors.push(`Node "${node.id}" (${node.type}): ${issues}`);
-    }
-  }
-  if (validationErrors.length > 0) {
-    throw new ValidationError(validationErrors.join("\n"));
-  }
+    const graph = prepareExecutionGraph(options.nodesOverride ?? workflow.nodes, options.edgesOverride ?? workflow.edges, options.selectedNodeIds, options.inputValues);
+    const estimates = await estimateWorkflowCost(graph.nodes);
+    const snapshot: RunSnapshot = {
+      ...graph, estimates, inputValues: options.inputValues, webhookUrl: options.webhookUrl, contractVersion: 2,
+      nodeVersions: Object.fromEntries(graph.nodes.map(n => [n.id, nodeRegistry.get(n.type)!.version])),
+      providers: Object.fromEntries(graph.nodes.map(n => [n.id, nodeRegistry.get(n.type)!.providers.map(p => ({ id: p.id, endpoints: p.endpoints.map(e => ({ id: e.id, taskId: e.taskId })) }))])),
+    };
+    const prepared = await tx.run.create({ data: {
+      workflowId: workflow.id, userId, scope: graph.scope, status: "PENDING",
+      accountingVersion: 1, workflowRevision: workflow.revision,
+      graphSnapshot: JSON.parse(JSON.stringify(snapshot)),
+      inputValues: options.inputValues as Prisma.InputJsonValue | undefined,
+      requestKey, requestHash,
+    } });
+    await reserveCredits(userId, prepared.id, estimates.total, tx);
+    await tx.nodeRun.createMany({ data: graph.nodes.map(node => ({ runId: prepared.id, nodeId: node.id, nodeType: node.type, status: "PENDING" })) });
+    return tx.run.findUniqueOrThrow({ where: { id: prepared.id } });
+  }, { timeout: 15_000 });
+  return dispatchRun(run);
+}
 
-  // ── Passthrough Label Uniqueness Validation ───────────────────────
-  // If inputValues are provided, duplicate labels would cause the same
-  // override to be applied to ALL matching nodes — silent data corruption.
-  // Auto-deduplicate before dispatching.
-  const labelChanges = deduplicatePassthroughLabels(
-    execNodes as Array<{ id: string; type?: string; data: Record<string, unknown> }>,
-    nodeRegistry,
-  );
-  if (labelChanges.length > 0) {
-    console.warn(
-      `[executeWorkflow] Auto-deduplicated ${labelChanges.length} passthrough labels:`,
-      labelChanges.map((c) => `${c.oldLabel} → ${c.newLabel} (${c.nodeId})`),
-    );
-  }
-
-  // ── Credit Estimation ─────────────────────────────────────────────
-  const costEstimate = await estimateWorkflowCost(
-    execNodes.map((n: any) => ({
-      id: n.id,
-      type: n.type || "unknown",
-      data: n.data ?? {},
-    })),
-  );
-  const estimatedCredits = costEstimate.total;
-
-  // ── Create Run record (needed for reservation FK) ─────────────────
-  const startTime = Date.now();
-  const run = await prisma.run.create({
-    data: {
-      userId,
-      workflowId,
-      scope,
-      status: "RUNNING",
-      inputValues: (inputValues ?? undefined) as any,
-    },
-  });
-
-  // ── Atomic Credit Reservation (block-on-estimate with FOR UPDATE) ─
-  // This serializes concurrent credit checks per-user, preventing
-  // overdraft when multiple runs fire simultaneously.
-  if (estimatedCredits > 0) {
+export async function dispatchRun(run: Run) {
+  const snapshot = run.graphSnapshot as unknown as RunSnapshot;
+  let triggerId = run.triggerId ?? undefined;
+  let publicAccessToken: string | undefined;
+  let status = run.status;
+  if (!triggerId && ["PENDING", "DISPATCH_UNKNOWN"].includes(status)) {
+    // Trigger idempotency has a finite lifetime; never replay an old ambiguous submission.
+    if (Date.now() - run.createdAt.getTime() >= 29 * 24 * 60 * 60 * 1000) throw new ValidationError("This run is outside the safe retry window and needs manual review");
     try {
-      await reserveCredits(userId, run.id, estimatedCredits);
-    } catch (err) {
-      // Clean up the Run record if reservation fails
-      await prisma.run.delete({ where: { id: run.id } });
-      throw err;
+      const handle = await tasks.trigger("orchestrate-workflow", { runId: run.id, userId: run.userId, recoveryAttempt: run.recoveryAttempt }, {
+        idempotencyKey: `nextflow:run:${run.id}${run.recoveryAttempt ? `:recovery:${run.recoveryAttempt}` : ""}`, idempotencyKeyTTL: "30d",
+        tags: [`run:${run.id}`], queue: "workflow-execution",
+      });
+      triggerId = handle.id;
+      publicAccessToken = (handle as { publicAccessToken?: string }).publicAccessToken;
+      await prisma.run.updateMany({ where: { id: run.id, recoveryAttempt: run.recoveryAttempt, settledAt: null }, data: { triggerId, dispatchError: null } });
+      await prisma.run.updateMany({ where: { id: run.id, recoveryAttempt: run.recoveryAttempt, status: "DISPATCH_UNKNOWN" }, data: { status: "PENDING" } });
+      status = (await prisma.run.findUniqueOrThrow({ where: { id: run.id } })).status;
+    } catch (error) {
+      const httpStatus = (error as { status?: number })?.status;
+      const rejected = [400, 401, 403, 404, 413, 422].includes(httpStatus ?? 0);
+      // A lost acknowledgment may hide an accepted job. Keep its reservation and identity.
+      await prisma.run.updateMany({ where: { id: run.id, recoveryAttempt: run.recoveryAttempt, status: { in: ["PENDING", "DISPATCH_UNKNOWN"] }, workerId: null }, data: {
+        status: "DISPATCH_UNKNOWN", dispatchError: rejected ? "Dispatch rejected" : "Dispatch acknowledgment unavailable",
+      } });
+      const current = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+      if (rejected && current.recoveryAttempt === run.recoveryAttempt && !current.workerId && !current.settledAt) {
+        try {
+          const settled = await finalizeRun(run.userId, run.id, "FAILED", { error: "Dispatch rejected before execution", terminalNodeStatus: "FAILED", requireUnclaimed: true, expectedRecoveryAttempt: run.recoveryAttempt });
+          status = settled.status;
+        } catch {
+          status = (await prisma.run.findUniqueOrThrow({ where: { id: run.id } })).status;
+        }
+      } else status = current.status;
     }
   }
-
-  // ── Batch-create NodeRun records (single DB write) ────────────────
-  await prisma.nodeRun.createMany({
-    data: execNodes.map((node: any) => ({
-      runId: run.id,
-      nodeId: node.id,
-      nodeType: node.type || "unknown",
-      status: "PENDING",
-    })),
-  });
-
-  // ── Dispatch to Trigger.dev ───────────────────────────────────────
-  const handle = await tasks.trigger<any>("orchestrate-workflow", {
-    runId: run.id,
-    userId,
-    nodes: execNodes,
-    edges: execEdges,
-    startTime,
-    inputValues,
-    reservedCredits: estimatedCredits, // For settlement after completion
-    webhookUrl,
-  }, {
-    tags: [`run:${run.id}`],
-    queue: "workflow-execution", // Must match the queue name in orchestrator.ts task definition
-  });
-
-  await prisma.run.update({
-    where: { id: run.id },
-    data: { triggerId: handle.id },
-  });
-
+  const latest = await prisma.run.findUniqueOrThrow({ where: { id: run.id } });
+  if (latest.recoveryAttempt !== run.recoveryAttempt || latest.triggerId !== triggerId) publicAccessToken = undefined;
+  triggerId = latest.triggerId ?? undefined;
+  status = latest.status;
   return {
-    executionId: run.id,
-    triggerId: handle.id,
-    status: "triggered" as const,
-    workflowId,
-    estimatedCredits,
-    scope,
-    nodeCount: execNodes.length,
-    // Actual nodes dispatched (from DB state) — lets callers verify correctness
-    executedNodes: execNodes.map((n: any) => ({
-      id: n.id,
-      type: n.type,
-      label: n.data?.label ?? n.type,
-    })),
-    // Trigger.dev SDK v4 may return a publicAccessToken on the handle
-    publicAccessToken: (handle as any).publicAccessToken as string | undefined,
+    executionId: run.id, triggerId, publicAccessToken,
+    status: triggerId && ["PENDING", "RUNNING"].includes(status) ? "triggered" : status.toLowerCase(),
+    workflowId: run.workflowId, estimatedCredits: run.reservedCredits, scope: run.scope,
+    nodeCount: snapshot.nodes.length,
+    executedNodes: snapshot.nodes.map(n => ({ id: n.id, type: n.type, label: n.data?.label ?? n.type })),
   };
+}
+
+export async function retryRunDispatch(userId: string, runId: string) {
+  const run = await prisma.run.findUnique({ where: { id: runId } });
+  if (!run || run.userId !== userId) throw new ExecutionNotFoundError(runId);
+  if (run.accountingVersion !== 1) throw new ValidationError("Legacy runs cannot be redispatched");
+  return dispatchRun(run);
+}
+
+export async function requestRunCancellation(userId: string, runId: string) {
+  const run = await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
+    await tx.$queryRaw`SELECT "id" FROM "Run" WHERE "id" = ${runId} FOR UPDATE`;
+    const current = await tx.run.findUnique({ where: { id: runId } });
+    if (!current || current.userId !== userId) throw new ExecutionNotFoundError(runId);
+    if (["SUCCESS", "FAILED", "PARTIAL", "CANCELLED"].includes(current.status)) return current;
+    if (current.accountingVersion !== 1) throw new ValidationError("Legacy runs require reconciliation before cancellation");
+    return tx.run.update({ where: { id: runId }, data: { status: "CANCEL_REQUESTED", cancellationRequestedAt: new Date() } });
+  });
+  if (run.status === "CANCEL_REQUESTED" && !run.workerId) {
+    return finalizeRun(userId, runId, "CANCELLED", { terminalNodeStatus: "CANCELLED", error: "Cancelled before execution" });
+  }
+  // Let in-flight provider tasks return their usage before releasing the unused reservation.
+  return { status: run.status };
 }
 
 // ── 5. getExecutionStatus ──────────────────────────────────────────────────
@@ -363,7 +309,7 @@ export async function getExecutionStatus(
     if (nr.error) {
       logs.push(`[${nr.nodeType}/${nr.nodeId}] ERROR: ${nr.error}`);
     }
-    if (nr.status === "COMPLETED") {
+    if (nr.status === "SUCCESS") {
       logs.push(`[${nr.nodeType}/${nr.nodeId}] completed`);
     }
   }
@@ -406,8 +352,8 @@ export async function cloneWorkflow(userId: string, sourceWorkflowId: string) {
       userId,
       name: `${source.name} (copy)`,
       description: source.description,
-      nodes: source.nodes as any,
-      edges: source.edges as any,
+      nodes: source.nodes as Prisma.InputJsonValue,
+      edges: source.edges as Prisma.InputJsonValue,
       // Private copy — user can later publish it as their own
       visibility: "private",
     },

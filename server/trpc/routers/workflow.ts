@@ -1,7 +1,8 @@
 import { z } from "zod";
+import type { Prisma } from "@prisma/client";
 import { createTRPCRouter, protectedProcedure } from "../trpc";
 import { TRPCError } from "@trpc/server";
-import { runs, auth } from "@trigger.dev/sdk/v3";
+import { auth } from "@trigger.dev/sdk";
 import { 
   SaveWorkflowSchema, 
   LoadWorkflowQuerySchema, 
@@ -13,10 +14,12 @@ import "@/lib/nodes/configs";
 import { getExposedInputs, deduplicatePassthroughLabels } from "@/lib/nodes/exposed-inputs";
 
 // ── Service Layer (shared with MCP) ────────────────────────────────────────
-import { executeWorkflow, cloneWorkflow } from "@/lib/services/workflow-service";
+import { executeWorkflow, cloneWorkflow, requestRunCancellation, retryRunDispatch } from "@/lib/services/workflow-service";
 import { estimateWorkflowCost } from "@/lib/credits/credit-service";
+import { recoverRun } from "@/lib/services/run-recovery";
 import {
   WorkflowNotFoundError,
+  WorkflowConflictError,
   InsufficientCreditsError,
   ValidationError,
   OwnershipError,
@@ -25,7 +28,8 @@ import {
 } from "@/lib/services/errors";
 
 // ── Domain Error → TRPCError Adapter ───────────────────────────────────────
-function translateServiceError(err: unknown): never {
+export function translateServiceError(err: unknown): never {
+  if (err instanceof WorkflowConflictError) throw new TRPCError({ code: "CONFLICT", message: err.message });
   if (err instanceof WorkflowNotFoundError) {
     throw new TRPCError({ code: "NOT_FOUND", message: err.message });
   }
@@ -69,7 +73,7 @@ export const workflowRouter = createTRPCRouter({
     .query(async ({ ctx }) => {
       const workflows = await ctx.prisma.workflow.findMany({
         where: { userId: ctx.auth.userId },
-        select: { id: true, name: true, updatedAt: true },
+        select: { id: true, name: true, updatedAt: true, revision: true },
         orderBy: { updatedAt: "desc" },
       });
       return workflows;
@@ -91,89 +95,60 @@ export const workflowRouter = createTRPCRouter({
       return workflow;
     }),
 
-  // 3. Save a workflow
+  // All editor writes compare the revision the editor actually loaded.
   save: protectedProcedure
-    .input(SaveWorkflowSchema)
+    .input(SaveWorkflowSchema.extend({
+      expectedRevision: z.number().int().nonnegative().optional(),
+      creationId: z.string().uuid().optional(),
+    }))
     .mutation(async ({ ctx, input }) => {
-      const { workflowId, name, nodes, edges } = input;
-      let workflow;
-
-      // ── Auto-deduplicate passthrough labels before persisting ────────
-      // Prevents the duplicate-label bug where the orchestrator's Step 0
-      // applies a single override to ALL matching nodes silently.
-      const mutableNodes = nodes ? [...(nodes as any[])] : [];
-      if (mutableNodes.length > 0) {
-        deduplicatePassthroughLabels(
-          mutableNodes as Array<{ id: string; type?: string; data: Record<string, unknown> }>,
-          nodeRegistry,
-        );
-      }
-
-      if (workflowId) {
-        const existing = await ctx.prisma.workflow.findUnique({ where: { id: workflowId } });
-        if (existing?.userId !== ctx.auth.userId) {
-          throw new TRPCError({ code: "FORBIDDEN" });
+      const nodes = structuredClone(input.nodes);
+      deduplicatePassthroughLabels(nodes, nodeRegistry);
+      const workflow = await ctx.prisma.$transaction(async tx => {
+        if (input.workflowId) {
+          if (input.expectedRevision === undefined) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Reload this workflow before saving. Its saved revision is required." });
+          const existing = await tx.workflow.findFirst({ where: { id: input.workflowId, userId: ctx.auth.userId } });
+          if (!existing) throw new TRPCError({ code: "NOT_FOUND" });
+          const result = await tx.workflow.updateMany({
+            where: { id: existing.id, userId: ctx.auth.userId, revision: input.expectedRevision },
+            data: { name: input.name ?? existing.name, nodes: nodes as Prisma.InputJsonValue, edges: input.edges as Prisma.InputJsonValue, revision: { increment: 1 } },
+          });
+          if (!result.count) throw new TRPCError({ code: "CONFLICT", message: "This workflow changed in another session. Your local draft has been kept. Export it or reload the saved version." });
+          return tx.workflow.findUniqueOrThrow({ where: { id: existing.id } });
         }
-
-        workflow = await ctx.prisma.workflow.update({
-          where: { id: workflowId },
-          data: {
-            name: name || existing.name,
-            nodes: mutableNodes as any,
-            edges: edges as any,
-          },
-        });
-      } else {
-        await ctx.prisma.user.upsert({
-          where: { id: ctx.auth.userId },
-          update: {},
-          create: { id: ctx.auth.userId },
-        });
-
-        workflow = await ctx.prisma.workflow.create({
-          data: {
-            userId: ctx.auth.userId,
-            name: name || "Untitled Workflow",
-            nodes: mutableNodes as any,
-            edges: edges as any,
-          },
-        });
-      }
-
-      return { success: true, workflowId: workflow.id };
+        await tx.user.createMany({ data: [{ id: ctx.auth.userId }], skipDuplicates: true });
+        const data = { userId: ctx.auth.userId, name: input.name || "Untitled Workflow", nodes: nodes as Prisma.InputJsonValue, edges: input.edges as Prisma.InputJsonValue };
+        if (input.creationId) await tx.workflow.createMany({ data: [{ id: input.creationId, ...data }], skipDuplicates: true });
+        const created = input.creationId
+          ? await tx.workflow.findUniqueOrThrow({ where: { id: input.creationId } })
+          : await tx.workflow.create({ data });
+        if (created.userId !== ctx.auth.userId) throw new TRPCError({ code: "NOT_FOUND" });
+        if (created.revision !== 0) throw new TRPCError({ code: "CONFLICT", message: "This newly created workflow was changed in another session. Export your local draft before opening its saved version from the dashboard." });
+        return created;
+      });
+      return { success: true, workflowId: workflow.id, revision: workflow.revision, workflow };
     }),
 
-  // 4. Lightweight update (auto-save + inline name edit)
   update: protectedProcedure
     .input(z.object({
       id: z.string(),
-      name: z.string().optional(),
-      nodes: z.array(z.any()).optional(),
-      edges: z.array(z.any()).optional(),
+      expectedRevision: z.number().int().nonnegative(),
+      name: SaveWorkflowSchema.shape.name,
+      nodes: SaveWorkflowSchema.shape.nodes.optional(),
+      edges: SaveWorkflowSchema.shape.edges.optional(),
     }))
     .mutation(async ({ ctx, input }) => {
-      const wf = await ctx.prisma.workflow.findUnique({ where: { id: input.id } });
-      if (!wf || wf.userId !== ctx.auth.userId) {
-        throw new TRPCError({ code: "FORBIDDEN" });
-      }
-
-      const data: Record<string, unknown> = { updatedAt: new Date() };
-      if (input.name !== undefined) data.name = input.name;
-      if (input.edges !== undefined) data.edges = input.edges;
-
-      // ── Auto-deduplicate passthrough labels on update ────────────────
-      if (input.nodes !== undefined) {
-        const mutableNodes = [...(input.nodes as any[])];
-        deduplicatePassthroughLabels(
-          mutableNodes as Array<{ id: string; type?: string; data: Record<string, unknown> }>,
-          nodeRegistry,
-        );
-        data.nodes = mutableNodes;
-      }
-
-      return ctx.prisma.workflow.update({
-        where: { id: input.id },
-        data,
+      const nodes = input.nodes === undefined ? undefined : structuredClone(input.nodes);
+      if (nodes) deduplicatePassthroughLabels(nodes, nodeRegistry);
+      return ctx.prisma.$transaction(async tx => {
+        const existing = await tx.workflow.findFirst({ where: { id: input.id, userId: ctx.auth.userId } });
+        if (!existing) throw new TRPCError({ code: "NOT_FOUND" });
+        const updated = await tx.workflow.updateMany({
+          where: { id: input.id, userId: ctx.auth.userId, revision: input.expectedRevision },
+          data: { name: input.name, nodes: nodes as Prisma.InputJsonValue, edges: input.edges as Prisma.InputJsonValue, revision: { increment: 1 } },
+        });
+        if (!updated.count) throw new TRPCError({ code: "CONFLICT", message: "This workflow changed in another session. Your local draft has been kept. Export it or reload the saved version." });
+        return tx.workflow.findUniqueOrThrow({ where: { id: input.id } });
       });
     }),
 
@@ -184,61 +159,35 @@ export const workflowRouter = createTRPCRouter({
   execute: protectedProcedure
     .input(ExecuteWorkflowSchema)
     .mutation(async ({ ctx, input }) => {
-      const { nodes, edges, selectedNodeIds, workflowId: inputWorkflowId, inputValues, webhookUrl } = input;
-
-      // ── tRPC-specific: auto-create or save workflow ────────────────────
-      let finalWorkflowId = inputWorkflowId;
-      if (!finalWorkflowId || finalWorkflowId === "temp-visual-id") {
-        await ctx.prisma.user.upsert({
-          where: { id: ctx.auth.userId },
-          update: {},
-          create: { id: ctx.auth.userId },
-        });
-        const workflow = await ctx.prisma.workflow.create({
-          data: {
-            userId: ctx.auth.userId,
-            name: "Untitled Workflow",
-            nodes: nodes as any,
-            edges: edges as any,
-          },
-        });
-        finalWorkflowId = workflow.id;
-      } else {
-        // Save current canvas state before execution
-        await ctx.prisma.workflow.update({
-          where: { id: finalWorkflowId },
-          data: { nodes: nodes as any, edges: edges as any },
-        });
-      }
-
-      // ── Delegate to service layer ──────────────────────────────────────
       try {
-        const result = await executeWorkflow(ctx.auth.userId, finalWorkflowId, {
-          selectedNodeIds: selectedNodeIds ?? undefined,
-          nodesOverride: nodes,
-          edgesOverride: edges,
-          inputValues,
-          webhookUrl,
+        const workflowId = input.workflowId === "temp-visual-id" ? "" : input.workflowId ?? "";
+        if (workflowId && input.expectedRevision === undefined) throw new ValidationError("Save and confirm the workflow revision before running");
+        const result = await executeWorkflow(ctx.auth.userId, workflowId, {
+          selectedNodeIds: input.selectedNodeIds,
+          nodesOverride: workflowId ? undefined : input.nodes, edgesOverride: workflowId ? undefined : input.edges,
+          inputValues: input.inputValues, webhookUrl: input.webhookUrl,
+          requestKey: input.idempotencyKey, saveCanvas: !workflowId, expectedRevision: input.expectedRevision,
         });
+        const publicAccessToken = result.publicAccessToken ?? (result.triggerId ? await mintRealtimeToken(result.triggerId) : undefined);
+        return { ...result, runId: result.executionId, publicAccessToken };
+      } catch (err) { translateServiceError(err); }
+    }),
 
-        // ── tRPC-specific: mint realtime token ───────────────────────────
-        // Primary: SDK v4 may return a token on the handle directly.
-        // Fallback: manually mint via auth.createPublicToken.
-        const publicAccessToken =
-          result.publicAccessToken ?? await mintRealtimeToken(result.triggerId);
+  retryDispatch: protectedProcedure
+    .input(z.object({ runId: z.string() }))
+    .mutation(async ({ ctx, input }) => {
+      try {
+        const result = await retryRunDispatch(ctx.auth.userId, input.runId);
+        const publicAccessToken = result.publicAccessToken ?? (result.triggerId ? await mintRealtimeToken(result.triggerId) : undefined);
+        return { ...result, runId: result.executionId, publicAccessToken };
+      } catch (err) { translateServiceError(err); }
+    }),
 
-        return {
-          runId: result.executionId,
-          triggerId: result.triggerId,
-          workflowId: finalWorkflowId,
-          scope: result.scope,
-          nodeCount: result.nodeCount,
-          estimatedCredits: result.estimatedCredits,
-          publicAccessToken,
-        };
-      } catch (err) {
-        translateServiceError(err);
-      }
+  recover: protectedProcedure
+    .input(z.object({ runId: z.string().min(1) }))
+    .mutation(async ({ ctx, input }) => {
+      try { return await recoverRun(ctx.auth.userId, input.runId); }
+      catch (error) { translateServiceError(error); }
     }),
 
   // 5a. Mint a scoped public access token for Trigger.dev Realtime
@@ -287,9 +236,10 @@ export const workflowRouter = createTRPCRouter({
 
   // 6. Get user's run history
   history: protectedProcedure
-    .query(async ({ ctx }) => {
+    .input(z.object({ workflowId: z.string().optional() }).optional())
+    .query(async ({ ctx, input }) => {
       const runs = await ctx.prisma.run.findMany({
-        where: { userId: ctx.auth.userId },
+        where: { userId: ctx.auth.userId, ...(input?.workflowId && { workflowId: input.workflowId }) },
         include: { nodeRuns: true },
         orderBy: { createdAt: "desc" },
         take: 50,
@@ -301,47 +251,24 @@ export const workflowRouter = createTRPCRouter({
   cancel: protectedProcedure
     .input(z.object({ runId: z.string() }))
     .mutation(async ({ ctx, input }) => {
-      const run = await ctx.prisma.run.findUnique({
-        where: { id: input.runId },
-      });
-      if (!run || run.userId !== ctx.auth.userId) {
-        throw new TRPCError({ code: "NOT_FOUND" });
-      }
-
-      if (run.triggerId) {
-        try {
-          await runs.cancel(run.triggerId);
-        } catch (e) {
-          console.error("Failed to cancel in trigger.dev", e);
-        }
-      }
-
-      await ctx.prisma.run.update({
-        where: { id: input.runId },
-        data: { status: "FAILED" },
-      });
-
-      await ctx.prisma.nodeRun.updateMany({
-        where: { runId: input.runId, status: { in: ["PENDING", "RUNNING"] } },
-        data: { status: "FAILED", error: "Cancelled by user" },
-      });
-      return { success: true };
+      try {
+        const result = await requestRunCancellation(ctx.auth.userId, input.runId);
+        return { success: result.status === "CANCELLED", status: result.status };
+      } catch (err) { translateServiceError(err); }
     }),
 
   // 8. Delete a workflow
   delete: protectedProcedure
     .input(z.object({ id: z.string() }))
     .mutation(async ({ ctx, input }) => {
-      const workflow = await ctx.prisma.workflow.findUnique({ where: { id: input.id } });
-      if (!workflow || workflow.userId !== ctx.auth.userId) {
-        throw new TRPCError({ code: "NOT_FOUND" });
-      }
-
-      await ctx.prisma.nodeRun.deleteMany({
-        where: { run: { workflowId: input.id } },
+      await ctx.prisma.$transaction(async tx => {
+        await tx.$queryRaw`SELECT "id" FROM "Workflow" WHERE "id" = ${input.id} FOR UPDATE`;
+        const workflow = await tx.workflow.findUnique({ where: { id: input.id } });
+        if (!workflow || workflow.userId !== ctx.auth.userId) throw new TRPCError({ code: "NOT_FOUND" });
+        const hasRuns = await tx.run.count({ where: { workflowId: input.id } });
+        if (hasRuns) throw new TRPCError({ code: "CONFLICT", message: "This workflow has run history and cannot be deleted while accounting records depend on it." });
+        await tx.workflow.delete({ where: { id: input.id } });
       });
-      await ctx.prisma.run.deleteMany({ where: { workflowId: input.id } });
-      await ctx.prisma.workflow.delete({ where: { id: input.id } });
 
       return { success: true };
     }),
@@ -373,21 +300,21 @@ export const workflowRouter = createTRPCRouter({
       return { success: true, workflowId: duplicate.id };
     }),
 
-  // 10. Rename a workflow
+  // Dashboard titles share the editor's optimistic revision boundary.
   rename: protectedProcedure
-    .input(z.object({ id: z.string(), name: z.string().min(1) }))
+    .input(z.object({ id: z.string(), name: z.string().trim().min(1).max(100), expectedRevision: z.number().int().nonnegative() }))
     .mutation(async ({ ctx, input }) => {
-      const workflow = await ctx.prisma.workflow.findUnique({ where: { id: input.id } });
-      if (!workflow || workflow.userId !== ctx.auth.userId) {
-        throw new TRPCError({ code: "NOT_FOUND" });
-      }
-
-      const updated = await ctx.prisma.workflow.update({
-        where: { id: input.id },
-        data: { name: input.name.trim() },
+      const workflow = await ctx.prisma.$transaction(async tx => {
+        const existing = await tx.workflow.findFirst({ where: { id: input.id, userId: ctx.auth.userId } });
+        if (!existing) throw new TRPCError({ code: "NOT_FOUND" });
+        const updated = await tx.workflow.updateMany({
+          where: { id: input.id, userId: ctx.auth.userId, revision: input.expectedRevision },
+          data: { name: input.name, revision: { increment: 1 } },
+        });
+        if (!updated.count) throw new TRPCError({ code: "CONFLICT", message: "This workflow changed in another session. Reload the saved title before renaming it." });
+        return tx.workflow.findUniqueOrThrow({ where: { id: input.id } });
       });
-
-      return { success: true, workflow: updated };
+      return { success: true, workflow };
     }),
 
   // 11. Get exposed (parameterizable) inputs for a workflow
@@ -563,6 +490,7 @@ export const workflowRouter = createTRPCRouter({
   executeTemplate: protectedProcedure
     .input(z.object({
       workflowId: z.string(),
+      idempotencyKey: z.string().min(1).max(128).optional(),
       values: z.record(z.string(), z.unknown()).optional(),
     }))
     .mutation(async ({ ctx, input }) => {
@@ -579,6 +507,7 @@ export const workflowRouter = createTRPCRouter({
       try {
         const result = await executeWorkflow(ctx.auth.userId, input.workflowId, {
           inputValues: input.values,
+          requestKey: input.idempotencyKey,
           skipOwnershipCheck: true, // consumer ≠ owner
         });
 
@@ -590,10 +519,11 @@ export const workflowRouter = createTRPCRouter({
 
         // ── tRPC-specific: mint realtime token ───────────────────────────
         const publicAccessToken =
-          result.publicAccessToken ?? await mintRealtimeToken(result.triggerId);
+          result.publicAccessToken ?? (result.triggerId ? await mintRealtimeToken(result.triggerId) : undefined);
 
         return {
           runId: result.executionId,
+          status: result.status,
           triggerId: result.triggerId,
           workflowId: workflow.id,
           estimatedCredits: result.estimatedCredits,

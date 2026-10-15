@@ -1,4 +1,5 @@
-import { logger, task } from "@trigger.dev/sdk/v3";
+import { publicFetch, LOCAL_MEDIA_INPUT_OPTIONS } from "../../lib/safe-fetch";
+import { logger, task } from "@trigger.dev/sdk";
 import crypto from "crypto";
 import ffmpeg from "fluent-ffmpeg";
 import fs from "fs/promises";
@@ -44,7 +45,7 @@ async function pollAssembly(
 ): Promise<any> {
   const start = Date.now();
   while (Date.now() - start < maxWait) {
-    const res = await fetch(assemblyUrl);
+    const res = await publicFetch(assemblyUrl, { maxBytes: 1024 * 1024 });
     const data = await res.json();
 
     if (data.ok === "ASSEMBLY_COMPLETED") {
@@ -111,7 +112,8 @@ export const cropImageTask = task({
   },
   id: "crop-image",
   retry: {
-    maxAttempts: 2,
+    // Upload creation is not idempotent; an unknown response must not replay it.
+    maxAttempts: 1,
   },
   run: async (payload: {
     imageUrl: string;
@@ -134,12 +136,12 @@ export const cropImageTask = task({
       throw new Error(`Failed to crop: Invalid image URL format -> ${payload.imageUrl}`);
     }
 
-    const tempDir = os.tmpdir();
-    const inputPath = path.join(tempDir, `crop_input_${Date.now()}.jpg`);
-    const outputPath = path.join(tempDir, `crop_output_${Date.now()}.jpg`);
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "nextflow-crop-"));
+    const inputPath = path.join(tempDir, "input.jpg");
+    const outputPath = path.join(tempDir, "output.jpg");
 
     try {
-      const imgResponse = await fetch(payload.imageUrl);
+      const imgResponse = await publicFetch(payload.imageUrl, { maxBytes: 20 * 1024 * 1024 });
       if (!imgResponse.ok)
         throw new Error(`Failed to fetch image: ${imgResponse.status}`);
       await fs.writeFile(
@@ -149,7 +151,7 @@ export const cropImageTask = task({
 
       const dimensions = await new Promise<{ width: number; height: number }>(
         (resolve, reject) => {
-          ffmpeg.ffprobe(inputPath, (err, metadata) => {
+          ffmpeg.ffprobe(inputPath, LOCAL_MEDIA_INPUT_OPTIONS, (err, metadata) => {
             if (err) return reject(new Error(`ffprobe error: ${err.message}`));
 
             const stream = metadata.streams?.find((s) => s.width && s.height);
@@ -190,6 +192,7 @@ export const cropImageTask = task({
 
       await new Promise<void>((resolve, reject) => {
         ffmpeg(inputPath)
+          .inputOptions(LOCAL_MEDIA_INPUT_OPTIONS)
           .outputOptions([`-vf`, `crop=${w}:${h}:${x}:${y}`])
           .output(outputPath)
           .on("end", () => resolve())
@@ -209,9 +212,7 @@ export const cropImageTask = task({
       logger.info("FFmpeg crop complete", { url });
       return { url };
     } finally {
-      // Clean up temp files silently
-      await fs.unlink(inputPath).catch(() => {});
-      await fs.unlink(outputPath).catch(() => {});
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
   },
 });
@@ -222,7 +223,8 @@ export const extractFrameTask = task({
   },
   id: "extract-frame",
   retry: {
-    maxAttempts: 2,
+    // Upload creation is not idempotent; an unknown response must not replay it.
+    maxAttempts: 1,
   },
   run: async (payload: { videoUrl: string; timestamp: string }) => {
     logger.info("Starting FFmpeg frame extraction", { payload });
@@ -239,12 +241,12 @@ export const extractFrameTask = task({
       throw new Error(`Failed to extract frame: Invalid video URL format -> ${payload.videoUrl}`);
     }
 
-    const tempDir = os.tmpdir();
-    const inputPath = path.join(tempDir, `extract_input_${Date.now()}.mp4`);
-    const outputPath = path.join(tempDir, `extract_output_${Date.now()}.jpg`);
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "nextflow-extract-frame-"));
+    const inputPath = path.join(tempDir, "input.mp4");
+    const outputPath = path.join(tempDir, "output.jpg");
 
     try {
-      const videoResponse = await fetch(payload.videoUrl);
+      const videoResponse = await publicFetch(payload.videoUrl);
       if (!videoResponse.ok)
         throw new Error(`Failed to fetch video: ${videoResponse.status}`);
       await fs.writeFile(
@@ -254,20 +256,25 @@ export const extractFrameTask = task({
 
       let seekSeconds: number;
       if (payload.timestamp.endsWith("%")) {
-        const percent = parseFloat(payload.timestamp.slice(0, -1)) || 50;
+        const parsedPercent = parseFloat(payload.timestamp.slice(0, -1));
+        const percent = Number.isFinite(parsedPercent) ? parsedPercent : 50;
 
-        const duration = await new Promise<number>((resolve, reject) => {
-          ffmpeg.ffprobe(inputPath, (err, metadata) => {
+        const timing = await new Promise<{ duration: number; lastFrameAt: number }>((resolve, reject) => {
+          ffmpeg.ffprobe(inputPath, LOCAL_MEDIA_INPUT_OPTIONS, (err, metadata) => {
             if (err) return reject(new Error(`ffprobe error: ${err.message}`));
 
-            // Safely parse duration as it might come back as a string
-            const rawDuration = metadata.format?.duration;
-            const parsedDuration = parseFloat(String(rawDuration || "0"));
-            resolve(parsedDuration);
+            const video = metadata.streams.find(stream => stream.codec_type === "video");
+            const duration = Number(video?.duration) || Number(metadata.format?.duration);
+            if (!Number.isFinite(duration) || duration <= 0) return reject(new Error("Could not determine video duration"));
+            const [numerator, denominator = 1] = String(video?.avg_frame_rate || video?.r_frame_rate || "24/1").split("/").map(Number);
+            const fps = numerator / denominator;
+            const frameDuration = Number.isFinite(fps) && fps > 0 ? 1 / fps : 1 / 24;
+            resolve({ duration, lastFrameAt: Math.max(0, duration - frameDuration) });
           });
         });
 
-        seekSeconds = (percent / 100) * duration;
+        // Exact EOF has no frame; 100% selects the final available frame.
+        seekSeconds = Math.min((percent / 100) * timing.duration, timing.lastFrameAt);
       } else {
         seekSeconds = parseFloat(payload.timestamp) || 0;
       }
@@ -279,6 +286,7 @@ export const extractFrameTask = task({
 
       await new Promise<void>((resolve, reject) => {
         ffmpeg(inputPath)
+          .inputOptions(LOCAL_MEDIA_INPUT_OPTIONS)
           .seekInput(seekSeconds)
           .outputOptions(["-vframes", "1", "-q:v", "2"]) // Added high-quality flag
           .output(outputPath)
@@ -304,8 +312,7 @@ export const extractFrameTask = task({
       logger.info("FFmpeg frame extraction complete", { url });
       return { url };
     } finally {
-      await fs.unlink(inputPath).catch(() => {});
-      await fs.unlink(outputPath).catch(() => {});
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
     }
   },
 });

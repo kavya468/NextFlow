@@ -12,6 +12,7 @@ import {
 import { trpc } from "@/lib/trpc/client";
 import { toast } from "sonner";
 import { Loader2 } from "lucide-react";
+import { APP_UI } from "@/lib/ui-config";
 
 interface PublishDialogProps {
   open: boolean;
@@ -21,12 +22,7 @@ interface PublishDialogProps {
   currentDescription?: string | null;
 }
 
-const CATEGORIES = [
-  { value: "image", label: "Image", emoji: "🖼" },
-  { value: "video", label: "Video", emoji: "🎬" },
-  { value: "audio", label: "Audio", emoji: "🎵" },
-  { value: "text", label: "Text", emoji: "📝" },
-] as const;
+
 
 export function PublishDialog({
   open,
@@ -81,7 +77,7 @@ export function PublishDialog({
               Category <span className="text-red-400">*</span>
             </label>
             <div className="grid grid-cols-4 gap-2">
-              {CATEGORIES.map((cat) => (
+              {APP_UI.publishCategories.map((cat) => (
                 <button
                   key={cat.value}
                   type="button"
@@ -92,7 +88,6 @@ export function PublishDialog({
                       : "bg-[var(--node-inner-bg)] border-[var(--node-inner-border)] text-[var(--text-muted)] hover:border-[var(--node-inner-border-hover)] hover:text-[var(--text-secondary)]"
                   }`}
                 >
-                  <span className="text-base">{cat.emoji}</span>
                   {cat.label}
                 </button>
               ))}

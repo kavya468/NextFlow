@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-labelledby="title description">
+  <title id="title">NextFlow — Your ideas, connected.</title>
+  <desc id="description">An editorial cover with precise blue, violet, amber, and rose connections between text, image, audio, and video nodes.</desc>
+  <defs>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" fill="#35353f"/></pattern>
+  </defs>
+  <rect width="1280" height="400" rx="20" fill="#111114"/>
+  <rect x="600" y="1" width="679" height="398" rx="20" fill="url(#dots)"/>
+  <g fill="#fafafa" font-family="Arial, Helvetica, sans-serif">
+    <g transform="translate(56 46)"><rect width="10" height="10" rx="2" fill="#38bdf8"/><rect x="15" width="10" height="10" rx="2" fill="#a78bfa"/><rect y="15" width="10" height="10" rx="2" fill="#fbbf24"/><rect x="15" y="15" width="10" height="10" rx="2" fill="#fb7185"/></g>
+    <text x="94" y="66" font-size="24" font-weight="700" letter-spacing="-0.7">NextFlow</text>
+    <text x="56" y="170" font-size="64" font-weight="700" letter-spacing="-2.8">Your ideas,</text>
+    <text x="56" y="240" font-size="64" font-weight="700" letter-spacing="-2.8">connected.</text>
+    <text x="58" y="292" fill="#b6b6c1" font-size="18">A visual workspace for text, image, audio, and video.</text>
+    <text x="58" y="356" fill="#92929f" font-size="13" letter-spacing="1.6">DESIGNED &amp; BUILT BY KAVYA</text>
+  </g>
+  <g fill="none" stroke-width="2">
+    <path d="M784 200 C830 200 814 111 860 111" stroke="#38bdf8"/>
+    <path d="M784 200 C830 200 814 289 860 289" stroke="#38bdf8"/>
+    <path d="M1014 111 C1055 111 1039 185 1080 185" stroke="#a78bfa"/>
+    <path d="M1014 289 C1055 289 1039 215 1080 215" stroke="#fbbf24"/>
+  </g>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <rect x="630" y="160" width="154" height="80" rx="12" fill="#1c1c23" stroke="#41414c"/>
+    <text x="650" y="190" font-size="11" letter-spacing="1.5" fill="#38bdf8">START HERE</text>
+    <text x="650" y="217" font-size="22" fill="#fafafa">Text</text>
+    <rect x="860" y="71" width="154" height="80" rx="12" fill="#211e2a" stroke="#594b74"/>
+    <text x="880" y="101" font-size="11" letter-spacing="1.5" fill="#bca6ee">IMAGINE</text>
+    <text x="880" y="128" font-size="22" fill="#fafafa">Image</text>
+    <rect x="860" y="249" width="154" height="80" rx="12" fill="#29251c" stroke="#6a5835"/>
+    <text x="880" y="279" font-size="11" letter-spacing="1.5" fill="#fbbf24">GIVE IT VOICE</text>
+    <text x="880" y="306" font-size="22" fill="#fafafa">Audio</text>
+    <rect x="1080" y="160" width="144" height="80" rx="12" fill="#2a1e23" stroke="#70434e"/>
+    <text x="1100" y="190" font-size="11" letter-spacing="1.5" fill="#fb9cad">SET IN MOTION</text>
+    <text x="1100" y="217" font-size="22" fill="#fafafa">Video</text>
+  </g>
+  <g stroke="#111114" stroke-width="3">
+    <circle cx="784" cy="200" r="6" fill="#38bdf8"/><circle cx="860" cy="111" r="6" fill="#38bdf8"/>
+    <circle cx="860" cy="289" r="6" fill="#38bdf8"/><circle cx="1014" cy="111" r="6" fill="#a78bfa"/>
+    <circle cx="1014" cy="289" r="6" fill="#fbbf24"/><circle cx="1080" cy="185" r="6" fill="#a78bfa"/>
+    <circle cx="1080" cy="215" r="6" fill="#fbbf24"/>
+  </g>
+</svg>

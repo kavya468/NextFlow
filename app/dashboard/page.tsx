@@ -1,3 +1,4 @@
+import { APP_UI } from "@/lib/ui-config";
 import { auth } from "@clerk/nextjs/server";
 import { prisma } from "@/lib/db";
 import Link from "next/link";
@@ -19,13 +20,13 @@ export default async function DashboardPage() {
 
   const workflows = await prisma.workflow.findMany({
     where: { userId },
-    select: { id: true, name: true, updatedAt: true, nodes: true, visibility: true, description: true },
+    select: { id: true, revision: true, name: true, updatedAt: true, nodes: true, visibility: true, description: true },
     orderBy: { updatedAt: "desc" },
   });
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-white">
-      {/* ===== Hero Section (Krea exact match) ===== */}
+      {/* Workflow studio introduction */}
       <div
         className="relative w-full bg-cover bg-center text-white p-6 lg:p-22"
         style={{
@@ -48,14 +49,13 @@ export default async function DashboardPage() {
         <div className="relative z-2 flex h-full w-full flex-col justify-between gap-6">
           <div className="flex flex-col gap-4">
             <div className="flex items-center gap-3">
-              <img alt="Node Editor icon." className="w-9 h-9" src="/node-editor-icon.png" />
+              <img alt="" className="w-9 h-9" src="/node-editor-icon.png" />
               <h1 className="text-3xl font-normal tracking-tight" style={{ fontWeight: 400 }}>
-                Node Editor
+                {APP_UI.dashboard.title}
               </h1>
             </div>
             <p className="font-normal text-base max-w-md" style={{ fontWeight: 400 }}>
-              Nodes is the most powerful way to operate Krea. Connect every tool
-              and model into complex automated pipelines.
+              {APP_UI.dashboard.description}
             </p>
           </div>
 
@@ -121,9 +121,10 @@ export default async function DashboardPage() {
 
             return (
               <WorkflowCard
-                key={w.id}
+                key={`${w.id}:${w.revision}`}
                 workflow={{
                   id: w.id,
+                  revision: w.revision,
                   name: w.name,
                   updatedAt: w.updatedAt.toISOString(),
                   nodes: w.nodes as any[],

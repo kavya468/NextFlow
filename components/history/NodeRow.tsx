@@ -5,6 +5,7 @@ import { ExternalLink } from "lucide-react";
 import { nodeRegistry } from "@/lib/nodes/registry";
 import "@/lib/nodes/configs";
 import { NodeDetailDialog } from "./NodeDetailDialog";
+import { RUN_UI } from "@/lib/ui-config";
 
 type NodeRun = {
   id: string;
@@ -19,17 +20,12 @@ type NodeRun = {
   providerUsed?: string | null;
 };
 
-const STATUS_DOT: Record<string, { color: string; pulse?: boolean }> = {
-  SUCCESS: { color: "bg-[var(--status-success)]" },
-  FAILED: { color: "bg-[var(--status-error)]" },
-  RUNNING: { color: "bg-[var(--status-running)]", pulse: true },
-  PENDING: { color: "bg-[var(--status-pending)]", pulse: true },
-};
-
 function StatusDot({ status }: { status: string }) {
-  const style = STATUS_DOT[status] ?? { color: "bg-[var(--status-unknown)]" };
+  const style = RUN_UI.status[status as keyof typeof RUN_UI.status] ?? { color: "bg-[var(--status-unknown)]", pulse: false, label: status };
   return (
     <span
+      title={style.label}
+      aria-label={style.label}
       className={`w-1.5 h-1.5 rounded-full shrink-0 ${style.color} ${style.pulse ? "animate-pulse" : ""}`}
     />
   );
@@ -41,12 +37,10 @@ interface NodeRowProps {
   isStale: boolean;
 }
 
-export function NodeRow({ nodeRun, isLast, isStale }: NodeRowProps) {
+export function NodeRow({ nodeRun }: NodeRowProps) {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
 
-  const displayStatus = isStale && (nodeRun.status === "RUNNING" || nodeRun.status === "PENDING")
-    ? "FAILED"
-    : nodeRun.status;
+  const displayStatus = nodeRun.status;
 
   const isFailed = displayStatus === "FAILED";
   const config = useMemo(() => nodeRegistry.get(nodeRun.nodeType), [nodeRun.nodeType]);
@@ -113,7 +107,7 @@ export function NodeRow({ nodeRun, isLast, isStale }: NodeRowProps) {
         </div>
 
         {/* Error display for failed nodes — keep inline for quick visibility */}
-        {isFailed && nodeRun.error && (
+        {(isFailed || displayStatus === "BLOCKED") && nodeRun.error && (
           <div className="px-2 pb-1.5 pl-[18px]">
             <p className="text-[11px] text-[var(--status-error)] opacity-90 leading-relaxed line-clamp-2">
               {nodeRun.error}

@@ -19,7 +19,7 @@ export const syncLipsyncConfig: NodeConfig = {
   description: "Synchronize lip movements in video to match audio via fal.ai",
   category: "media",
   icon: "AudioLines",
-  version: "1.0.0",
+  version: "2.0.0",
 
   inputs: [
     {

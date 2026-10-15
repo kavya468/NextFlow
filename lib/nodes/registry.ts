@@ -22,10 +22,8 @@ import type {
   NodeConfig,
   InputDefinition,
   OutputDefinition,
-  ProviderEndpoint,
-  IOType,
 } from "./types";
-import { DEFAULT_HANDLE_COLORS } from "./types";
+import { areHandleTypesCompatible, getInputDefinition } from "./handles";
 
 type MutableShape = Record<string, ZodTypeAny>;
 
@@ -70,7 +68,7 @@ function buildZodField(input: InputDefinition): ZodTypeAny {
     }
 
     case "boolean": {
-      field = z.coerce.boolean();
+      field = z.preprocess(value => value === "true" ? true : value === "false" ? false : value, z.boolean());
       break;
     }
 
@@ -79,6 +77,10 @@ function buildZodField(input: InputDefinition): ZodTypeAny {
       if (options && options.length > 0) {
         const values = options.map((o) => o.value) as [string, ...string[]];
         field = z.enum(values);
+        const aliases = input.validation?.aliases;
+        if (aliases) {
+          field = z.preprocess(value => typeof value === "string" && Object.hasOwn(aliases, value) ? aliases[value] : value, field);
+        }
       } else {
         field = z.string();
       }
@@ -91,13 +93,13 @@ function buildZodField(input: InputDefinition): ZodTypeAny {
 
   // Handle multi-value inputs (e.g., "images" array)
   if (input.multi) {
-    field = z.array(field);
+    field = z.preprocess(value => typeof value === "string" ? [value] : value, z.array(field));
   }
 
   // Make optional with default, or required
   if (!input.required) {
     if (input.default !== undefined) {
-      field = field.optional().default(input.default as any);
+      field = field.optional().default(input.default);
     } else {
       field = field.optional();
     }
@@ -107,20 +109,29 @@ function buildZodField(input: InputDefinition): ZodTypeAny {
 }
 
 function buildZodOutputField(output: OutputDefinition): ZodTypeAny {
+  let field: ZodTypeAny;
   switch (output.type) {
     case "text":
+    case "select":
+      field = z.string();
+      break;
     case "image":
     case "video":
     case "audio":
     case "file":
-      return z.string().optional();
+      field = z.string().url().refine(value => /^https?:\/\//i.test(value), "Media output must be an HTTP(S) URL");
+      break;
     case "number":
-      return z.number().optional();
+      field = z.number().finite();
+      break;
     case "boolean":
-      return z.boolean().optional();
+      field = z.boolean();
+      break;
     default:
-      return z.any().optional();
+      field = z.unknown();
   }
+  if (output.multi) field = z.array(field).min(1);
+  return output.optional ? field.optional() : field;
 }
 
 // ResolvedEndpoint — the result of endpoint resolution, ready for dispatch
@@ -279,6 +290,12 @@ class NodeRegistry {
           // Pass-through: use input keys directly
           Object.assign(payload, inputs);
         }
+        if (endpoint.dynamicInputPattern) {
+          const pattern = new RegExp(endpoint.dynamicInputPattern);
+          for (const [key, value] of Object.entries(inputs)) {
+            if (pattern.test(key)) payload[key] = value;
+          }
+        }
 
         return {
           taskId: endpoint.taskId,
@@ -387,11 +404,11 @@ class NodeRegistry {
     if (!sourceConfig || !targetConfig) return false;
 
     const sourceOutput = sourceConfig.outputs.find((o) => o.key === sourceHandleId);
-    const targetInput = targetConfig.inputs.find((i) => i.key === targetHandleId);
+    const targetInput = getInputDefinition(targetConfig, targetHandleId);
     if (!sourceOutput || !targetInput) return false;
 
     // Type compatibility matrix
-    return isTypeCompatible(sourceOutput.type, targetInput.type);
+    return (!sourceOutput.multi || !!targetInput.multi) && areHandleTypesCompatible(sourceOutput.type, targetInput.type);
   }
 
   // Credit Estimation — pre-execution cost display
@@ -417,30 +434,6 @@ class NodeRegistry {
     if (!config) return 0;
     return config.credits.calculate(inputs, response);
   }
-}
-
-// Type compatibility check — determines if data can flow between handles
-function isTypeCompatible(sourceType: IOType, targetType: IOType): boolean {
-  if (sourceType === targetType) return true;
-
-  // Text is the universal wire — it can flow into any target type.
-  // Coercion (z.coerce.number/boolean) + pre-flight validation handle safety.
-  if (sourceType === "text") return true;
-
-  // Image/video/audio URLs can flow into text inputs
-  if (["image", "video", "audio", "file"].includes(sourceType) && targetType === "text") {
-    return true;
-  }
-
-  // Media types are cross-compatible (they're all URLs)
-  if (
-    ["image", "video", "audio", "file"].includes(sourceType) &&
-    ["image", "video", "audio", "file"].includes(targetType)
-  ) {
-    return true;
-  }
-
-  return false;
 }
 
 // Singleton Export — the single source of truth for the entire application

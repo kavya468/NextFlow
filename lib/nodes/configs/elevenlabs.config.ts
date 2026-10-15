@@ -15,6 +15,7 @@
 // ============================================================================
 
 import type { NodeConfig } from "../types";
+import { BILLING_LIMITS, estimateNodeReservation, BILLING_RATES } from "../../credits/billing-policy";
 
 export const elevenlabsConfig: NodeConfig = {
   id: "elevenlabs-tts",
@@ -23,7 +24,7 @@ export const elevenlabsConfig: NodeConfig = {
     "Generate multi-speaker dialogue audio via ElevenLabs V3 on fal.ai",
   category: "ai",
   icon: "AudioLines",
-  version: "2.0.0",
+  version: "3.0.0",
 
   inputs: [
     // ── Standard inputs (always visible) ──────────────────────────────
@@ -36,7 +37,7 @@ export const elevenlabsConfig: NodeConfig = {
       isAdvanced: false,
       placeholder: "Add dialogue lines below",
       description:
-        "Add speaker lines with voice selection and text. Connect a Text node to provide dialogue as JSON.",
+        `Add speaker lines with voice selection and text. Connect a Text node for JSON. Maximum ${BILLING_LIMITS.dialogueBytes.toLocaleString()} UTF-8 bytes including connected lines.`,
       uiVariant: "dialogue-editor",
     },
 
@@ -117,6 +118,7 @@ export const elevenlabsConfig: NodeConfig = {
           id: "elevenlabs-generate",
           name: "Text to Dialogue",
           taskId: "elevenlabs-generate",
+          dynamicInputPattern: "^dialogue_text_\\d+$",
           inputMapping: {
             inputs: "inputs", // Changed from text/voice to inputs
             stability: "stability",
@@ -135,18 +137,17 @@ export const elevenlabsConfig: NodeConfig = {
   ],
 
   credits: {
-    estimate: (inputs) => {
-      // rough estimate, normally would count chars in JSON array
-      const str = typeof inputs.inputs === 'string' ? inputs.inputs : JSON.stringify(inputs.inputs || []);
-      return Math.ceil(str.length * 100);
-    },
-    calculate: (inputs, response: unknown) => {
+    estimate: () => estimateNodeReservation("elevenlabs-tts"),
+    calculate: (_inputs, response: unknown) => {
       const res = response as Record<string, unknown> | null;
       if (res && typeof res.cost === "number") {
         return Math.ceil(res.cost * 1_000_000);
       }
-      const str = typeof inputs.inputs === 'string' ? inputs.inputs : JSON.stringify(inputs.inputs || []);
-      return Math.ceil(str.length * 100);
+      const count = res?.billableCharacters;
+      if (typeof count !== "number" || !Number.isInteger(count) || count < 0 || count > BILLING_LIMITS.dialogueBytes) {
+        throw new Error("ElevenLabs response is missing a valid billable character count");
+      }
+      return count * BILLING_RATES.dialogueCharacter;
     },
   },
 

@@ -12,6 +12,14 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    "dist/**",
+    ".trigger/**",
+    ".agents/**",
+    ".agent/**",
+    // Audited TypeScript compiler output; lint the corresponding .ts sources.
+    "lib/nodes/**/*.js",
+    "lib/nodes/**/*.d.ts",
+    "server/trpc/**/*.js",
   ]),
 ]);
 

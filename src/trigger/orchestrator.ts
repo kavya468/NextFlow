@@ -1,926 +1,203 @@
-// ============================================================================
-// src/trigger/orchestrator.ts — Config-Driven DAG Executor
-// ============================================================================
-//
-// This is the core execution engine for NextFlow workflows. It receives a
-// serialized DAG (nodes + edges), topologically sorts them into parallel
-// execution layers, then dispatches each node using the NodeRegistry —
-// completely eliminating hardcoded if/else branching.
-//
-// EXECUTION MODEL:
-//   1. Build a topological sort → produce parallel "layers"
-//   2. For each layer, iterate nodes and classify them:
-//      a. PASSTHROUGH nodes (text, image, video) → resolve immediately
-//         via registry.resolvePassthrough() — no Trigger.dev dispatch
-//      b. ASYNC nodes (llm, crop, extract, ...) → resolve their endpoint
-//         via registry.resolveEndpoint() → batch dispatch to Trigger.dev
-//   3. After each batch completes, map raw provider outputs back to
-//      node output keys via registry.mapOutput()
-//   4. Store all intermediate results in nodeOutputs for downstream wiring
-//   5. Deduct actual credits post-completion via Postgres FOR UPDATE txn
-//
-// ARCHITECTURAL INVARIANT (MEMORY.md Rule 2):
-//   This orchestrator is NODE-TYPE-AGNOSTIC. It never inspects node.type
-//   to decide what to do. All dispatch logic lives in the NodeConfig's
-//   providers[] array, resolved dynamically by the registry.
-//
-// CREDIT DEDUCTION:
-//   Block-on-estimate at tRPC level (pre-check), deduct-on-completion here.
-//   Uses SELECT ... FOR UPDATE to prevent double-spend race conditions.
-//   DB failure in credit deduction does NOT crash the orchestrator.
-// ============================================================================
-
-import { logger, task, batch, metadata } from "@trigger.dev/sdk/v3";
+// Execute a saved graph; recovery reuses confirmed outputs and never replays unresolved work.
+import { logger, task, batch, metadata } from "@trigger.dev/sdk";
+import { Prisma } from "@prisma/client";
+import { publicFetch } from "../../lib/safe-fetch";
 import { prisma } from "../../lib/db";
 import { nodeRegistry } from "../../lib/nodes/registry";
-import { deductCredits, settleCredits } from "../../lib/credits/credit-service";
-
-// Ensure all node configs are registered before execution begins.
-// This import triggers the side-effect of calling nodeRegistry.registerAll().
+import { ExecutionReservationError, validateExecutionBudget } from "../../lib/credits/billing-policy";
+import { recordNodeResult, finalizeRun } from "../../lib/credits/credit-service";
+import { ValidationError } from "../../lib/services/errors";
+import { readExecutionSnapshot, nodeRecoveryTag, executionOutcome } from "../../lib/services/execution-state";
+import { resolveNodeInputs, mapAndValidateNodeOutput, normalizeExecutionEdges } from "../../lib/services/node-inputs";
 import "../../lib/nodes/configs";
 
-// ── DAG Orchestration Task ──────────────────────────────────────────────────
-
 export const orchestrateWorkflow = task({
-  machine: {
-    preset: "large-2x",
-  },
+  machine: { preset: "large-2x" },
   id: "orchestrate-workflow",
-  queue: {
-    name: "workflow-execution",
-    concurrencyLimit: 20, // Max 20 orchestrators running globally at once
-  },
-  retry: {
-    maxAttempts: 1, // DO NOT RETRY THE ORCHESTRATOR. Let individual nodes retry.
-  },
-  run: async (payload: {
-    runId: string;
-    userId: string;
-    nodes: any[];
-    edges: any[];
-    startTime?: number;
-    inputValues?: Record<string, unknown>;
-    reservedCredits?: number;
-    webhookUrl?: string;
-  }) => {
-    logger.info("Orchestrating Workflow DAG", { runId: payload.runId });
-
-    const { runId, userId, nodes, edges } = payload;
-    const executionStart = payload.startTime || Date.now();
-
-    // ── Step 0: Inject Parameterized Input Overrides ────────────────────
-    // If the caller provided inputValues (label→value map), merge them into
-    // matching nodes' data BEFORE execution begins.
-    //
-    // TWO RESOLUTION MODES:
-    //   1. Passthrough: key = nodeLabel → override the first passthroughMapping dataKey
-    //   2. Explicit:    key = nodeLabel.inputKey → override that specific data field
-    //
-    // Resolution is by node.data.label, NOT nodeId — stable across copies.
-    // The nodes array is a deserialized copy — mutations here only affect
-    // this execution's in-memory representation. The workflow template is
-    // untouched in the database.
-    if (payload.inputValues && Object.keys(payload.inputValues).length > 0) {
-      logger.info("Found runtime input overrides", { 
-        count: Object.keys(payload.inputValues).length,
-        keys: Object.keys(payload.inputValues) 
-      });
-
-      // Track which override labels resolved to which node IDs
-      // to detect multi-match corruption
-      const labelMatchTracker = new Map<string, string[]>();
-
-      for (const node of nodes) {
-        if (!node.type) continue;
-        const config = nodeRegistry.get(node.type);
-        if (!config) continue;
-
-        // Ensure fallback logic matches lib/nodes/exposed-inputs.ts exactly
-        const nodeLabel = (node.data?.label as string) || node.type;
-
-        // ── Mode 1: Passthrough label-match (backward compatible) ──────
-        if (config.isPassthrough && config.passthroughMapping) {
-          if (nodeLabel in payload.inputValues) {
-            // Track this label→nodeId mapping
-            if (!labelMatchTracker.has(nodeLabel)) {
-              labelMatchTracker.set(nodeLabel, []);
-            }
-            labelMatchTracker.get(nodeLabel)!.push(node.id);
-
-            const overrideValue = payload.inputValues[nodeLabel];
-            const dataKeys = Object.keys(config.passthroughMapping);
-            if (dataKeys.length > 0) {
-              const targetKey = dataKeys[0];
-              logger.info(`Applying Passthrough override [${nodeLabel}] -> ${targetKey}`, { 
-                nodeId: node.id, 
-                value: typeof overrideValue === 'string' ? overrideValue.substring(0, 50) : overrideValue 
-              });
-              if (!node.data) node.data = {};
-              node.data[targetKey] = overrideValue;
-            }
-          }
-        }
-
-        // ── Mode 2: Explicit label.inputKey override ───────────────────
-        const labelPrefix = `${nodeLabel}.`;
-        for (const [overrideKey, overrideValue] of Object.entries(payload.inputValues)) {
-          if (!overrideKey.startsWith(labelPrefix)) continue;
-
-          const inputKey = overrideKey.slice(labelPrefix.length);
-          logger.info(`Applying Label.Key override [${overrideKey}]`, { 
-            nodeId: node.id, 
-            inputKey,
-            value: typeof overrideValue === 'string' ? overrideValue.substring(0, 50) : overrideValue 
-          });
-          if (!node.data) node.data = {};
-          node.data[inputKey] = overrideValue;
-        }
-
-        // ── Mode 3: Explicit nodeId.inputKey override ────────────────────
-        // Highest precision: bypasses label collisions entirely.
-        const idPrefix = `${node.id}.`;
-        for (const [overrideKey, overrideValue] of Object.entries(payload.inputValues)) {
-          if (!overrideKey.startsWith(idPrefix)) continue;
-
-          const inputKey = overrideKey.slice(idPrefix.length);
-          logger.info(`Applying NodeId.Key override [${overrideKey}]`, { 
-            nodeId: node.id, 
-            inputKey,
-            value: typeof overrideValue === 'string' ? overrideValue.substring(0, 50) : overrideValue 
-          });
-          if (!node.data) node.data = {};
-          node.data[inputKey] = overrideValue;
-        }
-      }
-
-      // Check for multi-match corruption warnings
-      for (const [label, matchedNodeIds] of labelMatchTracker.entries()) {
-        if (matchedNodeIds.length > 1) {
-          logger.warn("⚠️ DUPLICATE LABEL DETECTED — override applied to multiple nodes", {
-            label,
-            matchedNodeIds,
-            nodeCount: matchedNodeIds.length,
-            hint: "This means the same value was injected into ALL these nodes. " +
-                  "Assign unique labels to prevent silent data corruption.",
-          });
-        }
-      }
-    } else {
-      logger.info("No runtime input overrides provided");
-    }
-
-
-    // Realtime metadata — streamed to the client via useRealtimeRun.
-    // Kept in local maps and flushed to Trigger.dev metadata on every transition.
-    const rtStatuses: Record<string, string> = {};
-    const rtOutputs: Record<string, Record<string, unknown>> = {};
-
-    function emitNodeStatus(
-      nodeId: string,
-      status: string,
-      outputs?: Record<string, unknown>
-    ) {
-      rtStatuses[nodeId] = status;
-      metadata.set("nodeStatuses", JSON.parse(JSON.stringify(rtStatuses)));
-      if (outputs) {
-        rtOutputs[nodeId] = outputs;
-        metadata.set("nodeOutputs", JSON.parse(JSON.stringify(rtOutputs)));
-      }
-    }
-
-    // ── Step 1: Topological Sort ──────────────────────────────────────────
-    // Build adjacency list + in-degree map for Kahn's algorithm.
-    // Produces execution "layers" where all nodes in a layer can run in
-    // parallel because their upstream dependencies have already resolved.
-
-    const adjList = new Map<string, string[]>();
-    const inDegree = new Map<string, number>();
-
-    for (const n of nodes) {
-      adjList.set(n.id, []);
-      inDegree.set(n.id, 0);
-    }
-
-    for (const e of edges) {
-      adjList.get(e.source)?.push(e.target);
-      if (inDegree.has(e.target)) {
-        inDegree.set(e.target, inDegree.get(e.target)! + 1);
-      }
-    }
-
-    // Seed the queue with root nodes (in-degree 0)
-    let queue: string[] = [];
-    inDegree.forEach((degree, nodeId) => {
-      if (degree === 0) queue.push(nodeId);
+  queue: { name: "workflow-execution", concurrencyLimit: 20 },
+  retry: { maxAttempts: 1 },
+  run: async (identity: { runId: string; userId: string; recoveryAttempt?: number }, { ctx }) => {
+    const { runId, userId } = identity;
+    const storedRun = await prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM "Run" WHERE id = ${runId} FOR UPDATE`;
+      const current = await tx.run.findUnique({ where: { id: runId } });
+      if (!current || current.userId !== userId || current.accountingVersion !== 1) throw new Error("Run contract or owner does not match");
+      if (current.workerId || current.recoveryAttempt !== (identity.recoveryAttempt ?? 0) || !["PENDING", "DISPATCH_UNKNOWN"].includes(current.status)) return null;
+      return tx.run.update({ where: { id: runId }, data: { status: "RUNNING", workerId: ctx.run.id, triggerId: ctx.run.id, dispatchError: null } });
     });
-
-    // BFS to produce parallel execution layers
-    const layers: string[][] = [];
-    while (queue.length > 0) {
-      const nextQueue: string[] = [];
-      const currentLayer: string[] = [];
-
-      for (const nodeId of queue) {
-        currentLayer.push(nodeId);
-        for (const neighbor of adjList.get(nodeId) || []) {
-          inDegree.set(neighbor, inDegree.get(neighbor)! - 1);
-          if (inDegree.get(neighbor) === 0) nextQueue.push(neighbor);
-        }
-      }
-
-      layers.push(currentLayer);
-      queue = nextQueue;
-    }
-
-    // Cycle detection — if we didn't process all nodes, there's a cycle
-    if (layers.flat().length !== nodes.length) {
-      logger.error("Cycle detected in DAG", {
-        processed: layers.flat().length,
-        total: nodes.length,
-      });
-      await updateRunStatus(runId, "FAILED", Date.now() - executionStart);
-      return;
-    }
-
-    logger.info("DAG layers calculated", { layerCount: layers.length, layers });
-
-    // Credit pre-check happens in the tRPC layer (estimateWorkflowCost + getBalance).
-    // Actual deduction happens post-completion inside the batch result loop below.
-
-    // ── Step 2: Layer-by-Layer Execution ───────────────────────────────────
-    // nodeOutputs accumulates the resolved output of every executed node.
-    // Downstream nodes read their inputs from this map via edge wiring.
-
-    const nodeOutputs = new Map<string, Record<string, unknown>>();
+    if (!storedRun) return { skipped: true };
+    const executionStart = storedRun.createdAt.getTime();
+    let payload: ReturnType<typeof readExecutionSnapshot> | undefined;
+    const states: Record<string, string> = {};
+    const outputs = new Map<string, Record<string, unknown>>();
+    const emit = (nodeId: string, status: string) => {
+      states[nodeId] = status;
+      // Outputs remain in the database; broadcasting complete media/prompt data is unbounded.
+      metadata.set("nodeStatuses", { ...states });
+    };
 
     try {
-      for (let i = 0; i < layers.length; i++) {
-        const layer = layers[i];
-        logger.info(`Executing layer ${i + 1}/${layers.length}`, { nodes: layer });
+      payload = readExecutionSnapshot(storedRun.graphSnapshot);
+      const { nodes } = payload;
+      const edges = normalizeExecutionEdges(nodes, payload.edges);
+      for (const node of nodes) {
+        const config = nodeRegistry.get(node.type);
+        if (!config || payload.nodeVersions[node.id] !== config.version) throw new Error("Node definition changed since this run was prepared; start a new run");
+        const quote = payload.estimates.perNode.find(item => item.nodeId === node.id);
+        if (!quote || quote.estimate < config.credits.estimate(node.data)) throw new ExecutionReservationError("Node has no sufficient prepared budget");
+      }
+      const savedNodes = await prisma.nodeRun.findMany({ where: { runId } });
+      if (savedNodes.length !== nodes.length || new Set(savedNodes.map(node => node.nodeId)).size !== nodes.length) throw new Error("Saved node executions do not match the graph");
+      for (const saved of savedNodes) {
+        states[saved.nodeId] = saved.status;
+        if (saved.status === "RUNNING") throw new Error("Unresolved node execution must be reconciled before resuming");
+        if (saved.status === "SUCCESS") {
+          if (!saved.outputs || typeof saved.outputs !== "object" || Array.isArray(saved.outputs)) throw new Error("Confirmed node output is missing");
+          outputs.set(saved.nodeId, saved.outputs as Record<string, unknown>);
+        }
+      }
 
-        // Collect batch items for async (non-passthrough) nodes in this layer
-        const batchItems: { id: string; payload: Record<string, unknown> }[] = [];
-        // Track metadata per-node for timing, result mapping, and credit deduction
-        const layerMeta: Record<string, {
-          nodeStart: number;
-          finalInputs: Record<string, unknown>;
-          endpointId: string | null;
-          providerId: string | null;
-        }> = {};
-        // Track which nodeIds correspond to batch items (ordered)
-        const asyncNodeIds: string[] = [];
+      const indegree = new Map(nodes.map(node => [node.id, 0]));
+      for (const edge of edges) {
+        if (!indegree.has(edge.source) || !indegree.has(edge.target)) throw new Error("Saved edge references a missing node");
+        indegree.set(edge.target, indegree.get(edge.target)! + 1);
+      }
+      let ready = nodes.filter(node => indegree.get(node.id) === 0).map(node => node.id);
+      const layers: string[][] = [];
+      while (ready.length) {
+        layers.push(ready);
+        const next: string[] = [];
+        for (const nodeId of ready) for (const edge of edges.filter(edge => edge.source === nodeId)) {
+          indegree.set(edge.target, indegree.get(edge.target)! - 1);
+          if (indegree.get(edge.target) === 0) next.push(edge.target);
+        }
+        ready = next;
+      }
+      if (layers.flat().length !== nodes.length) throw new Error("Invalid cyclic graph");
 
+      for (const layer of layers) {
+        const current = await prisma.run.findUniqueOrThrow({ where: { id: runId } });
+        if (current.settledAt) return;
+        if (current.status === "CANCEL_REQUESTED") break;
+        const jobs: Array<{ nodeId: string; nodeType: string; startedAt: number; inputs: Record<string, unknown>; taskId: string; endpointId: string; providerId: string; payload: Record<string, unknown> }> = [];
         for (const nodeId of layer) {
-          const nodeStart = Date.now();
-          const node = nodes.find((n: any) => n.id === nodeId);
-          if (!node) continue;
-
-          // ── Wire upstream outputs into this node's inputs ──────────────
-          // For each incoming edge, pull the relevant output field from the
-          // source node's resolved outputs and assign it to the target handle.
-          const incomingEdges = edges.filter((e: any) => e.target === nodeId);
-          const inputs: Record<string, unknown> = {};
-
-          for (const edge of incomingEdges) {
-            const sourceOutput = nodeOutputs.get(edge.source);
-            if (!sourceOutput || !edge.targetHandle) continue;
-
-            // ── Resolve the value from the source node's outputs ──────────
-            // The sourceHandle should match a key in sourceOutput. However,
-            // legacy edges may reference old handle IDs (e.g., "output") that
-            // no longer match the config-driven output keys (e.g., "text").
-            //
-            // Lookup chain:
-            //   1. Exact match: sourceOutput[edge.sourceHandle]
-            //   2. Single-output fallback: if the source has only one output
-            //      key and the handle didn't match, use that single value
-            //      (covers legacy "output" → config "text" migration)
-            let value: unknown;
-            if (edge.sourceHandle && edge.sourceHandle in sourceOutput) {
-              // Direct match — config handle IDs align
-              value = sourceOutput[edge.sourceHandle];
-            } else {
-              // Fallback — the source node likely has only one output.
-              // Use its first (and only) value regardless of key name.
-              const outputKeys = Object.keys(sourceOutput);
-              if (outputKeys.length > 0) {
-                value = sourceOutput[outputKeys[0]];
-                logger.info(`Edge fallback: "${edge.sourceHandle}" not in source outputs [${outputKeys}], using "${outputKeys[0]}"`, {
-                  edgeId: edge.id,
-                  source: edge.source,
-                  target: edge.target,
-                });
-              }
-            }
-
-            // Skip if we couldn't resolve any value
-            if (value === undefined) continue;
-
-            // Multi-value inputs (e.g., "images") aggregate into arrays
-            const targetConfig = nodeRegistry.get(node.type);
-            const targetInput = targetConfig?.inputs.find(
-              (inp) => inp.key === edge.targetHandle
-            );
-
-            if (targetInput?.multi) {
-              // Track values by source node ID for reordering support
-              const orderKey = `_multiSources_${edge.targetHandle}`;
-              if (!inputs[orderKey]) {
-                inputs[orderKey] = [] as Array<{ sourceId: string; value: unknown }>;
-              }
-              (inputs[orderKey] as Array<{ sourceId: string; value: unknown }>).push({
-                sourceId: edge.source,
-                value,
-              });
-            } else {
-              inputs[edge.targetHandle] = value;
-            }
+          if (states[nodeId] !== "PENDING") continue;
+          const node = nodes.find(node => node.id === nodeId)!;
+          const incoming = edges.filter(edge => edge.target === nodeId);
+          if (incoming.some(edge => ["PENDING", "RUNNING"].includes(states[edge.source]))) continue;
+          const blockedBy = [...new Set(incoming.filter(edge => states[edge.source] !== "SUCCESS").map(edge => edge.source))];
+          if (blockedBy.length) {
+            await failNode(userId, runId, nodeId, "BLOCKED", `Blocked by unsuccessful dependencies: ${blockedBy.join(", ")}`);
+            emit(nodeId, "BLOCKED");
+            continue;
           }
-
-          // ── Reorder multi-inputs using _inputOrder ──────────────────────
-          // The UI stores node.data._inputOrder[handleKey] as an ordered array
-          // of source node IDs. Use that order when building the final arrays.
-          const inputOrder = (node.data?._inputOrder as Record<string, string[]>) || {};
-
-          for (const key of Object.keys(inputs)) {
-            if (!key.startsWith("_multiSources_")) continue;
-            const handleKey = key.replace("_multiSources_", "");
-            const tracked = inputs[key] as Array<{ sourceId: string; value: unknown }>;
-            const savedOrder = inputOrder[handleKey];
-
-            let orderedValues: unknown[];
-            if (savedOrder && savedOrder.length > 0) {
-              // Reorder tracked values according to savedOrder
-              const bySource = new Map<string, unknown>();
-              for (const entry of tracked) {
-                bySource.set(entry.sourceId, entry.value);
-              }
-              orderedValues = [];
-              // First: values in the saved order
-              for (const sourceId of savedOrder) {
-                if (bySource.has(sourceId)) {
-                  orderedValues.push(bySource.get(sourceId));
-                  bySource.delete(sourceId);
-                }
-              }
-              // Then: any remaining values not in the saved order (newly added)
-              for (const remaining of bySource.values()) {
-                orderedValues.push(remaining);
-              }
-            } else {
-              // No saved order — use edge iteration order (original behavior)
-              orderedValues = tracked.map((t) => t.value);
-            }
-
-            inputs[handleKey] = orderedValues;
-            delete inputs[key]; // Clean up tracking key
+          const startedAt = Date.now();
+          let inputs: Record<string, unknown>;
+          try {
+            inputs = resolveNodeInputs(node, incoming, outputs, payload.inputValues);
+            validateExecutionBudget(node.type, inputs, payload.estimates.perNode.find(quote => quote.nodeId === nodeId)!.estimate);
+          } catch (error) {
+            if (!(error instanceof ValidationError) || error instanceof ExecutionReservationError) throw error;
+            await failNode(userId, runId, nodeId, "FAILED", error.message);
+            emit(nodeId, "FAILED");
+            continue;
           }
-
-          // Merge node.data (default values) with wired upstream values.
-          // Upstream connections take precedence over static canvas data.
-          let finalInputs: Record<string, unknown> = { ...node.data, ...inputs };
-
-          // ── Runtime Override Re-Injection (Precedence Fix) ──────────────
-          // If the user provided runtime overrides (API/Template UI), these
-          // MUST prevail over even the edge wiring. This ensures that
-          // "Exposed Inputs" in the UI behave as the absolute source of truth.
-          if (payload.inputValues) {
-            const nodeLabel = (node.data?.label as string) || node.type;
-            const config = nodeRegistry.get(node.type);
-
-            // Re-apply same logic as Step 0 to finalInputs
-            // Mode 1: Passthrough label
-            if (config?.isPassthrough && config.passthroughMapping && nodeLabel in payload.inputValues) {
-              const targetKey = Object.keys(config.passthroughMapping)[0];
-              finalInputs[targetKey] = payload.inputValues[nodeLabel];
-            }
-            // Mode 2: Label.Key
-            const labelPrefix = `${nodeLabel}.`;
-            // Mode 3: NodeId.Key
-            const idPrefix = `${node.id}.`;
-
-            for (const [k, v] of Object.entries(payload.inputValues)) {
-              if (k.startsWith(labelPrefix)) {
-                finalInputs[k.slice(labelPrefix.length)] = v;
-              } else if (k.startsWith(idPrefix)) {
-                finalInputs[k.slice(idPrefix.length)] = v;
-              }
-            }
+          const passthrough = nodeRegistry.resolvePassthrough(node.type, inputs);
+          if (passthrough !== null) {
+            await recordNodeResult(userId, runId, nodeId, { inputs, outputs: passthrough, creditsUsed: 0, durationMs: Date.now() - startedAt });
+            outputs.set(nodeId, passthrough);
+            emit(nodeId, "SUCCESS");
+            continue;
           }
-
-          // Sanitize any array inputs to remove undefined/null/empty strings.
-          // This prevents PrismaClientValidationError when empty connection
-          // ports inject undefined values into array fields (like 'images').
-          for (const key of Object.keys(finalInputs)) {
-            if (Array.isArray(finalInputs[key])) {
-              finalInputs[key] = (finalInputs[key] as any[]).filter(
-                (val) => val !== undefined && val !== null && val !== ""
-              );
-            }
+          const resolved = nodeRegistry.resolveEndpoint(node.type, inputs);
+          if (!resolved) {
+            await failNode(userId, runId, nodeId, "FAILED", `No provider endpoint is configured for ${node.type}`);
+            emit(nodeId, "FAILED");
+            continue;
           }
-
-          // Strip internal UI metadata (e.g., _inputOrder) from task payloads
-          for (const key of Object.keys(finalInputs)) {
-            if (key.startsWith("_")) {
-              delete finalInputs[key];
-            }
+          jobs.push({ nodeId, nodeType: node.type, startedAt, inputs, ...resolved });
+        }
+        if (!jobs.length) continue;
+        const admitted = await prisma.$transaction(async tx => {
+          await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM "Run" WHERE id = ${runId} FOR UPDATE`;
+          const current = await tx.run.findUniqueOrThrow({ where: { id: runId } });
+          if (current.status !== "RUNNING" || current.settledAt || current.workerId !== ctx.run.id) return false;
+          for (const job of jobs) {
+            const updated = await tx.nodeRun.updateMany({ where: { runId, nodeId: job.nodeId, status: "PENDING" }, data: {
+              status: "RUNNING", inputs: json(job.inputs), taskId: job.taskId, endpointId: job.endpointId, providerUsed: job.providerId,
+            } });
+            if (updated.count !== 1) throw new Error("Node admission is not unique");
           }
-
-          logger.info(`Processing node ${node.type} (${nodeId})`, { finalInputs });
-
-          // ── Runtime Zod Validation of Merged Inputs ─────────────────────
-          // The full payload (static + upstream) is now assembled. Validate
-          // against the complete schema — at this point, all required fields
-          // should be present. If upstream hallucinated bad data or a source
-          // node failed, this catches it. Marks the node FAILED without
-          // crashing the batch (MEMORY.md: single-node failure → PARTIAL).
-          if (node.type && nodeRegistry.has(node.type)) {
-            const inputSchema = nodeRegistry.getInputSchema(node.type);
-            const parseResult = inputSchema.safeParse(finalInputs);
-            if (!parseResult.success) {
-              const issues = parseResult.error.issues
-                .map((iss: any) => `${iss.path.join(".")}: ${iss.message}`)
-                .join("; ");
-              const errMsg = `Input validation failed: ${issues}`;
-              logger.warn(`Node ${nodeId} failed runtime input validation`, {
-                nodeType: node.type,
-                issues: parseResult.error.issues,
-              });
-              await updateNodeRun(
-                runId, nodeId, "FAILED",
-                finalInputs, null, errMsg,
-                Date.now() - nodeStart
-              );
-              emitNodeStatus(nodeId, "FAILED");
+          return true;
+        });
+        if (!admitted) break;
+        for (const job of jobs) emit(job.nodeId, "RUNNING");
+        const result = await batch.triggerAndWait(jobs.map(job => ({ id: job.taskId, payload: job.payload, options: {
+          idempotencyKey: `nextflow:${runId}:${job.nodeId}`, idempotencyKeyTTL: "30d", tags: [nodeRecoveryTag(runId, job.nodeId)],
+        } })));
+        if (result.runs.length !== jobs.length) throw new Error("The child result list is incomplete; retain the reservation for recovery");
+        for (const [index, job] of jobs.entries()) {
+          const child = result.runs[index];
+          if (child.id) await prisma.nodeRun.updateMany({ where: { runId, nodeId: job.nodeId, status: "RUNNING" }, data: { triggerId: child.id } });
+          if (!child.ok) {
+            if (payload.estimates.perNode.find(quote => quote.nodeId === job.nodeId)!.estimate > 0) {
+              await prisma.nodeRun.updateMany({ where: { runId, nodeId: job.nodeId, status: "RUNNING" }, data: { error: "Provider outcome is unconfirmed. Recovery will check before releasing the hold." } });
               continue;
             }
-
-            // Strictly isolate inputs by reassigning to the Zod-stripped validated object.
-            // This prevents outputs (e.g. `result`, `result_text`) from `node.data`
-            // from leaking into task payloads.
-            //
-            // IMPORTANT: Only strip for non-passthrough nodes. Passthrough nodes
-            // store their data in node.data fields (e.g. `url`) that are NOT in
-            // the input schema — stripping would destroy them.
-            const config = nodeRegistry.get(node.type);
-            if (!config?.isPassthrough) {
-              for (const key of Object.keys(finalInputs)) {
-                delete finalInputs[key];
-              }
-              Object.assign(finalInputs, parseResult.data);
-            }
-
-            // ── Dynamic Element Handle Assembly ────────────────────────────
-            // For nodes with allowDynamicHandles that have element_N_frontal /
-            // element_N_ref_M keys (e.g., Kling O1), reassemble them into the
-            // structured elements[] array expected by the task.
-            // This runs after Zod validation (.passthrough() preserves dynamic
-            // keys) and before endpoint resolution maps inputs to the payload.
-            if (config?.allowDynamicHandles) {
-              const elementMap = new Map<number, {
-                frontal_image_url: string;
-                reference_image_urls: string[];
-              }>();
-
-              for (const key of Object.keys(finalInputs)) {
-                // Match element_N_frontal
-                const frontalMatch = key.match(/^element_(\d+)_frontal$/);
-                if (frontalMatch) {
-                  const idx = parseInt(frontalMatch[1], 10);
-                  if (!elementMap.has(idx)) {
-                    elementMap.set(idx, { frontal_image_url: "", reference_image_urls: [] });
-                  }
-                  const val = finalInputs[key];
-                  if (typeof val === "string" && val.length > 0) {
-                    elementMap.get(idx)!.frontal_image_url = val;
-                  }
-                  delete finalInputs[key];
-                  continue;
-                }
-
-                // Match element_N_ref_M
-                const refMatch = key.match(/^element_(\d+)_ref_(\d+)$/);
-                if (refMatch) {
-                  const idx = parseInt(refMatch[1], 10);
-                  const refIdx = parseInt(refMatch[2], 10);
-                  if (!elementMap.has(idx)) {
-                    elementMap.set(idx, { frontal_image_url: "", reference_image_urls: [] });
-                  }
-                  const val = finalInputs[key];
-                  if (typeof val === "string" && val.length > 0) {
-                    const refs = elementMap.get(idx)!.reference_image_urls;
-                    // Ensure the array is large enough
-                    while (refs.length <= refIdx) refs.push("");
-                    refs[refIdx] = val;
-                  }
-                  delete finalInputs[key];
-                  continue;
-                }
-              }
-
-              // If we found any dynamic element keys, build the elements array
-              if (elementMap.size > 0) {
-                const sortedIndices = Array.from(elementMap.keys()).sort((a, b) => a - b);
-                const assembledElements = sortedIndices.map((idx) => {
-                  const el = elementMap.get(idx)!;
-                  // Filter out empty reference URLs
-                  el.reference_image_urls = el.reference_image_urls.filter((u) => u.length > 0);
-                  return el;
-                });
-
-                // Merge with existing elements array (from manual UI input) if present
-                const existingElements = finalInputs.elements;
-                if (Array.isArray(existingElements) && existingElements.length > 0) {
-                  // Dynamic handle values override matching indices, append new ones
-                  for (let i = 0; i < assembledElements.length; i++) {
-                    const assembled = assembledElements[i];
-                    if (i < existingElements.length) {
-                      // Override only if dynamic handle had a value
-                      if (assembled.frontal_image_url) {
-                        existingElements[i].frontal_image_url = assembled.frontal_image_url;
-                      }
-                      if (assembled.reference_image_urls.length > 0) {
-                        // Merge references: override matching indices
-                        for (let r = 0; r < assembled.reference_image_urls.length; r++) {
-                          if (assembled.reference_image_urls[r]) {
-                            existingElements[i].reference_image_urls[r] =
-                              assembled.reference_image_urls[r];
-                          }
-                        }
-                      }
-                    } else {
-                      existingElements.push(assembled);
-                    }
-                  }
-                  finalInputs.elements = existingElements;
-                } else {
-                  finalInputs.elements = assembledElements;
-                }
-
-                logger.info("Assembled dynamic element handles into elements[]", {
-                  nodeId,
-                  elementCount: (finalInputs.elements as unknown[]).length,
-                });
-              }
-            }
-          }
-
-          await updateNodeRun(runId, nodeId, "RUNNING", finalInputs, null, null);
-          emitNodeStatus(nodeId, "RUNNING");
-
-          // ── Classify: Passthrough vs Async ──────────────────────────────
-          // The registry decides — we never inspect node.type ourselves.
-
-          const passthroughOutput = nodeRegistry.resolvePassthrough(
-            node.type,
-            finalInputs
-          );
-
-          if (passthroughOutput !== null) {
-            nodeOutputs.set(nodeId, passthroughOutput);
-            await updateNodeRun(
-              runId, nodeId, "SUCCESS",
-              finalInputs, passthroughOutput, null,
-              Date.now() - nodeStart
-            );
-            emitNodeStatus(nodeId, "SUCCESS", passthroughOutput);
-            layerMeta[nodeId] = { nodeStart, finalInputs, endpointId: null, providerId: null };
+            await failNode(userId, runId, job.nodeId, "FAILED", "Provider task failed; dependent steps were not run");
+            emit(job.nodeId, "FAILED");
             continue;
           }
-
-          // ASYNC: resolve the provider endpoint from the registry
-          const resolved = nodeRegistry.resolveEndpoint(node.type, finalInputs);
-
-          if (!resolved) {
-            const errMsg = `No endpoint resolved for node type "${node.type}"`;
-            logger.warn(errMsg, { nodeId });
-            await updateNodeRun(
-              runId, nodeId, "FAILED",
-              finalInputs, null, errMsg,
-              Date.now() - nodeStart
-            );
-            emitNodeStatus(nodeId, "FAILED");
-            continue;
-          }
-
-          // Queue for batch dispatch
-          batchItems.push({ id: resolved.taskId, payload: resolved.payload });
-          asyncNodeIds.push(nodeId);
-          layerMeta[nodeId] = {
-            nodeStart,
-            finalInputs,
-            endpointId: resolved.endpointId,
-            providerId: resolved.providerId,
-          };
-        }
-
-        // ── Batch Dispatch ────────────────────────────────────────────────
-        // All async nodes in this layer fire in parallel via Trigger.dev's
-        // batch.triggerAndWait. Results come back in the same order.
-
-        if (batchItems.length > 0) {
-          logger.info(
-            `Dispatching ${batchItems.length} async tasks in layer ${i + 1}...`
-          );
-
-          try {
-            const batchResult = await batch.triggerAndWait<any>(batchItems);
-
-            for (let j = 0; j < asyncNodeIds.length; j++) {
-              const nodeId = asyncNodeIds[j];
-              const result = batchResult.runs[j];
-              const { nodeStart, finalInputs, endpointId, providerId } = layerMeta[nodeId];
-              const node = nodes.find((n: any) => n.id === nodeId);
-
-              if (result.ok) {
-                // Map raw provider output → node output keys via registry
-                const rawOutput = result.output as Record<string, unknown>;
-                const mappedOutput = node?.type && endpointId
-                  ? nodeRegistry.mapOutput(node.type, endpointId, rawOutput)
-                  : rawOutput;
-
-                nodeOutputs.set(nodeId, mappedOutput);
-
-                // ── Credit Deduction (post-completion) ─────────────────
-                // Calculate actual cost from the provider response and write
-                // a single negative ledger entry for this node.
-                let creditsUsed = 0;
-                if (node?.type) {
-                  try {
-                    creditsUsed = nodeRegistry.calculateCredits(
-                      node.type,
-                      finalInputs,
-                      rawOutput
-                    );
-
-                    const nodeRun = await prisma.nodeRun.findFirst({
-                      where: { runId, nodeId },
-                      select: { id: true },
-                    });
-                    if (nodeRun && creditsUsed > 0) {
-                      await deductCredits(
-                        userId,
-                        runId,
-                        nodeRun.id,
-                        creditsUsed,
-                        node.type
-                      );
-                    }
-                    logger.info("Credits deducted", {
-                      nodeId,
-                      nodeType: node.type,
-                      creditsUsed,
-                    });
-                  } catch (creditErr: any) {
-                    logger.error("Credit deduction failed (non-fatal)", {
-                      nodeId,
-                      nodeType: node.type,
-                      error: creditErr.message,
-                    });
-                  }
-                }
-
-                await updateNodeRun(
-                  runId, nodeId, "SUCCESS",
-                  finalInputs, mappedOutput, null,
-                  Date.now() - nodeStart,
-                  providerId ?? undefined,
-                  creditsUsed
-                );
-                emitNodeStatus(nodeId, "SUCCESS", mappedOutput);
-              } else {
-                // ── Non-fatal node failure ──────────────────────────────
-                // Mark this node FAILED but do NOT throw — downstream nodes
-                // that depend on it will simply receive no input and fail
-                // or skip gracefully. The orchestrator continues executing
-                // independent branches so we get PARTIAL instead of FAILED.
-                const errMsg = `Task failed: ${
-                  (result.error as any)?.message || "Unknown error"
-                }`;
-                logger.error(`Node ${nodeId} failed (non-fatal)`, { error: result.error });
-                await updateNodeRun(
-                  runId, nodeId, "FAILED",
-                  finalInputs, null, errMsg,
-                  Date.now() - nodeStart,
-                  providerId ?? undefined
-                );
-                emitNodeStatus(nodeId, "FAILED");
-              }
-            }
-          } catch (batchError: any) {
-            // Only reaches here if batch.triggerAndWait itself crashes
-            // (network failure, Trigger.dev infra issue). Mark all nodes
-            // in this batch as FAILED individually.
-            logger.error(`Batch infrastructure error in layer ${i + 1}`, {
-              error: batchError.message,
-            });
-            for (const nodeId of asyncNodeIds) {
-              const { nodeStart, finalInputs } = layerMeta[nodeId];
-              await updateNodeRun(
-                runId, nodeId, "FAILED",
-                finalInputs, null,
-                `Batch dispatch failed: ${batchError.message}`,
-                Date.now() - nodeStart
-              );
-              emitNodeStatus(nodeId, "FAILED");
-            }
-          }
-        }
-
-        logger.info(`Layer ${i + 1} complete`);
-      }
-
-      const nodeRuns = await prisma.nodeRun.findMany({
-        where: { runId },
-        select: { status: true },
-      });
-
-      const hasFailed = nodeRuns.some((nr) => nr.status === "FAILED");
-      const hasSuccess = nodeRuns.some((nr) => nr.status === "SUCCESS");
-
-      let finalStatus = "SUCCESS";
-      if (hasFailed) {
-        finalStatus = hasSuccess ? "PARTIAL" : "FAILED";
-      }
-
-      logger.info(`Workflow completed with status: ${finalStatus}`);
-      await updateRunStatus(runId, finalStatus, Date.now() - executionStart);
-      metadata.set("runStatus", finalStatus);
-
-      // ── Credit Settlement ───────────────────────────────────────────
-      // Refund the difference between reserved and actually spent credits.
-      if (payload.reservedCredits && payload.reservedCredits > 0) {
-        try {
-          const actualNodeRuns = await prisma.nodeRun.findMany({
-            where: { runId },
-            select: { creditsUsed: true },
-          });
-          const actualTotal = actualNodeRuns.reduce(
-            (sum, nr) => sum + (nr.creditsUsed ?? 0),
-            0,
-          );
-          const { refunded } = await settleCredits(
-            userId,
-            runId,
-            payload.reservedCredits,
-            actualTotal,
-          );
-          if (refunded > 0) {
-            logger.info("Credits settled — refund issued", {
-              reserved: payload.reservedCredits,
-              actual: actualTotal,
-              refunded,
-            });
-          }
-        } catch (settleErr: any) {
-          logger.error("Credit settlement failed (non-fatal)", {
-            error: settleErr.message,
-          });
+          const mapped = mapAndValidateNodeOutput(job.nodeType, job.endpointId, child.output);
+          const creditsUsed = nodeRegistry.calculateCredits(job.nodeType, job.inputs, child.output);
+          await recordNodeResult(userId, runId, job.nodeId, { inputs: job.inputs, outputs: mapped, providerUsed: job.providerId, creditsUsed, durationMs: Date.now() - job.startedAt });
+          outputs.set(job.nodeId, mapped);
+          emit(job.nodeId, "SUCCESS");
         }
       }
-
-      // ── Webhook Notification ──────────────────────────────────────────
-      if (payload.webhookUrl) {
-        try {
-          await fetch(payload.webhookUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              event: finalStatus === "SUCCESS" ? "run.completed" : "run.failed",
-              runId,
-              status: finalStatus,
-            }),
-          });
-          logger.info("Webhook notification sent", { url: payload.webhookUrl });
-        } catch (webhookErr: any) {
-          logger.error("Failed to send webhook notification", { error: webhookErr.message });
-        }
+      const current = await prisma.run.findUniqueOrThrow({ where: { id: runId }, include: { nodeRuns: true } });
+      if (current.nodeRuns.some(node => node.status === "RUNNING")) throw new Error("Provider outcomes need reconciliation before settlement");
+      const status = executionOutcome(current.nodeRuns.map(node => node.status), current.status === "CANCEL_REQUESTED");
+      await finalizeRun(userId, runId, status, { terminalNodeStatus: status === "CANCELLED" ? "CANCELLED" : "FAILED", durationMs: Date.now() - executionStart });
+      metadata.set("runStatus", status);
+      await notify(payload.webhookUrl, runId, status, Object.fromEntries(outputs));
+    } catch (error) {
+      const current = await prisma.run.findUniqueOrThrow({ where: { id: runId }, include: { nodeRuns: true } });
+      if (current.nodeRuns.some(node => node.status === "RUNNING")) {
+        await prisma.run.updateMany({ where: { id: runId, settledAt: null }, data: { dispatchError: "Execution needs reconciliation. Check recovery to confirm provider results before continuing." } });
+      } else if (!current.settledAt) {
+        const outcome = executionOutcome(current.nodeRuns.map(node => node.status), current.status === "CANCEL_REQUESTED");
+        const status = outcome === "SUCCESS" ? "FAILED" : outcome;
+        await finalizeRun(userId, runId, status, { terminalNodeStatus: status === "CANCELLED" ? "CANCELLED" : "FAILED", durationMs: Date.now() - executionStart, error: "Execution stopped" });
+        metadata.set("runStatus", status);
+        await notify(payload?.webhookUrl, runId, status, Object.fromEntries(outputs));
       }
-    } catch (err: any) {
-      logger.error("Workflow failed during execution", { error: err.message });
-
-      const nodeRuns = await prisma.nodeRun.findMany({
-        where: { runId },
-        select: { status: true, creditsUsed: true },
-      });
-      const hasSuccess = nodeRuns.some((nr) => nr.status === "SUCCESS");
-      const finalStatus = hasSuccess ? "PARTIAL" : "FAILED";
-      await updateRunStatus(runId, finalStatus, Date.now() - executionStart);
-      metadata.set("runStatus", finalStatus);
-
-      // ── Credit Settlement on failure ─────────────────────────────────
-      if (payload.reservedCredits && payload.reservedCredits > 0) {
-        try {
-          const actualTotal = nodeRuns.reduce(
-            (sum, nr) => sum + (nr.creditsUsed ?? 0),
-            0,
-          );
-          await settleCredits(userId, runId, payload.reservedCredits, actualTotal);
-          logger.info("Credits settled on failure", {
-            reserved: payload.reservedCredits,
-            actual: actualTotal,
-          });
-        } catch (settleErr: any) {
-          logger.error("Credit settlement on failure failed (non-fatal)", {
-            error: settleErr.message,
-          });
-        }
-      }
-
-      // ── Webhook Notification on failure ───────────────────────────────
-      if (payload.webhookUrl) {
-        try {
-          await fetch(payload.webhookUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              event: "run.failed",
-              runId,
-              status: finalStatus,
-              error: err.message,
-            }),
-          });
-          logger.info("Webhook notification sent on failure", { url: payload.webhookUrl });
-        } catch (webhookErr: any) {
-          logger.error("Failed to send webhook notification on failure", { error: webhookErr.message });
-        }
-      }
-
-      throw err;
+      throw error;
     }
   },
 });
 
-// ── Database Helpers ────────────────────────────────────────────────────────
+function json(value: Record<string, unknown>) {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
 
-async function updateRunStatus(
-  runId: string,
-  status: string,
-  durationMs?: number
-) {
-  const isTerminal = ["SUCCESS", "FAILED", "PARTIAL"].includes(status);
-  await prisma.run.update({
-    where: { id: runId },
-    data: {
-      status,
-      ...(durationMs !== undefined && { durationMs }),
-      ...(isTerminal && { completedAt: new Date() }),
-    },
+async function failNode(userId: string, runId: string, nodeId: string, status: "FAILED" | "BLOCKED", error: string) {
+  await prisma.$transaction(async tx => {
+    await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM "Run" WHERE id = ${runId} FOR UPDATE`;
+    const run = await tx.run.findUniqueOrThrow({ where: { id: runId } });
+    if (run.settledAt) return;
+    await tx.nodeRun.updateMany({ where: { runId, nodeId, status: { in: ["PENDING", "RUNNING"] } }, data: { status, error } });
   });
 }
 
-// ── Prisma-safe deep sanitizer ──────────────────────────────────────────────
-// Recursively strips `undefined` values from objects and arrays before they
-// reach Prisma. This prevents PrismaClientValidationError when unconnected
-// multi-input handles inject undefined into arrays (e.g., images: [undefined]).
-function sanitizeForPrisma(value: unknown): unknown {
-  if (value === undefined) return null;
-  if (value === null || typeof value !== "object") return value;
-
-  if (Array.isArray(value)) {
-    return value
-      .filter((item) => item !== undefined)
-      .map((item) => sanitizeForPrisma(item));
-  }
-
-  const result: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if (v !== undefined) {
-      result[k] = sanitizeForPrisma(v);
-    }
-  }
-  return result;
-}
-
-async function updateNodeRun(
-  runId: string,
-  nodeId: string,
-  status: string,
-  inputs: any,
-  outputs: any,
-  error: string | null,
-  durationMs?: number,
-  providerUsed?: string,
-  creditsUsed?: number
-) {
-  const nodeRun = await prisma.nodeRun.findFirst({
-    where: { runId, nodeId },
-  });
-
-  if (nodeRun) {
-    await prisma.nodeRun.update({
-      where: { id: nodeRun.id },
-      data: {
-        status,
-        inputs: sanitizeForPrisma(inputs) as any,
-        outputs: sanitizeForPrisma(outputs) as any,
-        ...(error && { error }),
-        ...(durationMs !== undefined && { durationMs }),
-        ...(providerUsed !== undefined && { providerUsed }),
-        ...(creditsUsed !== undefined && { creditsUsed }),
-      },
-    });
+async function notify(url: string | undefined, runId: string, status: string, outputs: Record<string, unknown>) {
+  if (!url) return;
+  try {
+    await publicFetch(url, { maxBytes: 64 * 1024, timeoutMs: 10_000, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ event: status === "SUCCESS" ? "run.completed" : "run.failed", runId, status, outputs }) });
+  } catch {
+    logger.warn("Run settled but its callback could not be delivered", { runId });
   }
 }
-
-// Credit deduction handled by lib/credits/credit-service.ts → deductCredits()

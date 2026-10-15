@@ -13,10 +13,11 @@
 //   - The sidebar palette entry ("LLM" with Bot icon, category "ai")
 //   - The Zod input schema (model: enum, system_prompt: string?, ...)
 //   - The orchestrator dispatch (taskId: "generate-llm-content", mapped payload)
-//   - Credit cost estimation (token-length based estimate)
+//   - Maximum credit reservation and token-usage settlement
 // ============================================================================
 
 import type { NodeConfig } from "../types";
+import { BILLING_LIMITS, estimateNodeReservation } from "../../credits/billing-policy";
 
 export const llmConfig: NodeConfig = {
   id: "llm",
@@ -24,7 +25,7 @@ export const llmConfig: NodeConfig = {
   description: "Generate text using a large language model",
   category: "ai",
   icon: "Bot",
-  version: "1.0.0",
+  version: "2.0.0",
 
   // ---------------------------------------------------------------------------
   // INPUTS — Each generates a Handle + UI Control + Zod field
@@ -47,6 +48,7 @@ export const llmConfig: NodeConfig = {
     },
     {
       key: "system_prompt",
+      validation: { maxLength: BILLING_LIMITS.systemPromptCharacters },
       type: "text",
       label: "System Prompt",
       required: false,
@@ -57,6 +59,7 @@ export const llmConfig: NodeConfig = {
     },
     {
       key: "user_message",
+      validation: { maxLength: BILLING_LIMITS.userMessageCharacters },
       type: "text",
       label: "User Message",
       required: true,
@@ -93,7 +96,7 @@ export const llmConfig: NodeConfig = {
       default: 2048,
       isAdvanced: true,
       description: "Maximum number of tokens to generate",
-      validation: { min: 1, max: 8192, step: 1 },
+      validation: { min: 1, max: BILLING_LIMITS.outputTokens, step: 1 },
     },
   ],
 
@@ -127,6 +130,8 @@ export const llmConfig: NodeConfig = {
             system_prompt: "systemPrompt",
             user_message: "userMessage",
             images: "images",
+            max_tokens: "max_tokens",
+            temperature: "temperature",
           },
           outputMapping: {
             text: "text",
@@ -137,15 +142,10 @@ export const llmConfig: NodeConfig = {
   ],
 
   // ---------------------------------------------------------------------------
-  // CREDITS — Token-length based estimation
+  // CREDITS — Maximum reservation and token-usage settlement
   // ---------------------------------------------------------------------------
   credits: {
-    estimate: (inputs) => {
-      const model = (inputs.model as string) ?? "";
-      const msg = String(inputs.user_message || "");
-      const ratePerChar = model.includes("claude") ? 5 : 2;
-      return Math.ceil(msg.length * ratePerChar) + 2_000;
-    },
+    estimate: () => estimateNodeReservation("llm"),
     calculate: (inputs, response: unknown) => {
       const res = response as Record<string, unknown> | null;
       const usage = res?.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;

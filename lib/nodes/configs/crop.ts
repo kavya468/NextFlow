@@ -1,21 +1,3 @@
-// ============================================================================
-// lib/nodes/configs/crop.ts — Crop Image Node Configuration
-// ============================================================================
-//
-// This is the first node ported to the Config-Driven system.
-// It replaces:
-//   - components/nodes/CropNode.tsx (135 lines of hand-coded React)
-//   - The if/else branch in orchestrator.ts lines 119-129
-//   - The hardcoded entry in LeftSidebar.tsx line 65
-//
-// From this single ~80 line config file, the system auto-generates:
-//   - The complete React Flow node UI (via GenericNode.tsx)
-//   - The sidebar palette entry ("Crop Image" with icon)
-//   - The Zod input schema (image_url: string, x_percent: number, etc.)
-//   - The orchestrator dispatch (taskId: "crop-image", mapped payload)
-//   - Credit cost estimation
-// ============================================================================
-
 import type { NodeConfig } from "../types";
 
 export const cropConfig: NodeConfig = {

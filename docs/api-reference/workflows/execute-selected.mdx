@@ -3,133 +3,15 @@ title: "Execute Selected Nodes"
 openapi: "POST /v1/workflows/{id}/execute-selected"
 ---
 
-## Partial Execution
-
-Run only specific nodes (and their upstream dependencies) from a workflow. The system
-automatically discovers and includes all upstream nodes needed to satisfy the selected nodes' inputs.
-
----
-
-### `selectedNodeIds` — Required
-
-Specify which nodes to execute by their internal node IDs. All upstream dependencies are
-included automatically.
+Runs the requested nodes and their upstream dependencies from the saved workflow. Supply internal IDs from `GET /api/v1/workflows/{id}`:
 
 ```json
 {
-  "selectedNodeIds": ["hero-image", "hero-crop"]
+  "idempotencyKey": "selected-001",
+  "selectedNodeIds": ["YOUR_TARGET_NODE_ID"]
 }
 ```
 
----
+The response uses scope `SINGLE` for one selected node or `PARTIAL` for several, and includes the number of nodes admitted with their dependencies. Either scope can finish with status `SUCCESS` when every admitted node succeeds.
 
-### `variables` — Override Exposed Inputs by Label ✨
-
-Override values for inputs that have been **exposed** in the canvas editor. Keys must match
-the exact node **label** — not the node ID.
-
-<Warning>
-  `variables` **only works with exposed inputs**. If the node label doesn't match any
-  exposed input, the override is silently ignored. Use `inputs` for non-exposed fields.
-</Warning>
-
-#### Passthrough node override
-
-If your text node has the default label `"text"`:
-
-```json
-{
-  "variables": {
-    "text": {
-      "text": "A revolutionary AR headset for designers"
-    }
-  }
-}
-```
-
-#### Explicitly exposed field override
-
-If an LLM node labeled `"Writer"` has `system_prompt` exposed:
-
-```json
-{
-  "variables": {
-    "Writer": {
-      "system_prompt": "Write in a casual, Gen-Z tone"
-    }
-  }
-}
-```
-
-<Tip>
-  Check your node labels in the canvas editor. The label shown on the node header is the
-  exact key you need to use in `variables`.
-</Tip>
-
----
-
-### `inputs` — Override Any Field by Node ID
-
-Override **any** field on **any** node by targeting the internal node ID. Works for all
-fields regardless of exposure status.
-
-```json
-{
-  "inputs": {
-    "reviewer_llm": {
-      "model": "openai/gpt-4o",
-      "system_prompt": "Be concise and critical."
-    }
-  }
-}
-```
-
----
-
-### `webhook` — Async Notification
-
-Receive `POST` requests when the partial execution completes or fails.
-
-```json
-{
-  "webhook": {
-    "url": "https://your-app.com/api/webhook/nextflow",
-    "events": ["run.completed", "run.failed"]
-  }
-}
-```
-
----
-
-## Full Example
-
-```bash
-curl --request POST \
-  --url https://next-flow-beta.vercel.app/api/v1/workflows/YOUR_WORKFLOW_ID/execute-selected \
-  --header 'Authorization: Bearer nf_YOUR_API_KEY' \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "selectedNodeIds": ["hero-image", "hero-crop"],
-    "variables": {
-      "text": {
-        "text": "A revolutionary AR headset for designers"
-      }
-    },
-    "webhook": {
-      "url": "https://webhook.site/your-unique-id",
-      "events": ["run.completed", "run.failed"]
-    }
-  }'
-```
-
-<ResponseExample>
-```json 200
-{
-  "runId": "run_abc123",
-  "workflowId": "wf_xyz",
-  "scope": "PARTIAL",
-  "nodeCount": 2,
-  "estimatedCredits": 500
-}
-```
-</ResponseExample>
+The `inputs`, `variables`, `idempotencyKey`, and `webhook` fields follow the same contract and limitations as [full workflow execution](/api-reference/workflows/execute). Selected runs resolve fresh upstream inputs; they do not treat old canvas previews as successful dependencies.

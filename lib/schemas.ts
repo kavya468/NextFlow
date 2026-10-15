@@ -3,14 +3,14 @@ import { z } from "zod";
 
 
 export const NodeSchema = z.object({
-  id: z.string(),
+  id: z.string().min(1),
   type: z.string(),
   position: z.object({ x: z.number(), y: z.number() }),
   data: z.record(z.string(), z.unknown()).default({}),
 }).passthrough();
 
 export const EdgeSchema = z.object({
-  id: z.string(),
+  id: z.string().min(1),
   source: z.string(),
   target: z.string(),
   sourceHandle: z.string().nullable().optional(),
@@ -20,6 +20,8 @@ export const EdgeSchema = z.object({
 
 
 export const ExecuteWorkflowSchema = z.object({
+  expectedRevision: z.number().int().nonnegative().optional(),
+  idempotencyKey: z.string().min(1).max(128).optional(),
   nodes: z.array(NodeSchema).min(1, "At least one node is required"),
   edges: z.array(EdgeSchema),
   workflowId: z.string().optional(),

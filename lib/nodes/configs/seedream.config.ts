@@ -14,11 +14,12 @@
 // inputMapping so the task receives a clean signal.
 //
 // CREDITS:
-//   - Estimate: flat 15,000 credits (~$0.015)
-//   - Actual: fal.ai's credits_used field when available, 15,000 fallback
+//   - Reserve the supported maximum because image-count controls can be wired.
+//   - Settle from a provider cost when supplied, or the returned image count.
 // ============================================================================
 
 import type { NodeConfig } from "../types";
+import { BILLING_LIMITS, estimateNodeReservation, BILLING_RATES } from "../../credits/billing-policy";
 
 export const seedreamConfig: NodeConfig = {
   id: "seedream-4.5",
@@ -26,7 +27,7 @@ export const seedreamConfig: NodeConfig = {
   description: "Text-to-image and image editing via fal.ai",
   category: "ai",
   icon: "Sparkles",
-  version: "1.0.0",
+  version: "3.0.0",
 
   // ---------------------------------------------------------------------------
   // INPUTS — Each generates a Handle + UI Control + Zod field
@@ -49,6 +50,7 @@ export const seedreamConfig: NodeConfig = {
     },
     {
       key: "prompt",
+      validation: { maxLength: BILLING_LIMITS.promptCharacters },
       type: "text",
       label: "Prompt",
       required: true,
@@ -60,6 +62,7 @@ export const seedreamConfig: NodeConfig = {
     {
       key: "image_urls",
       type: "image",
+      multi: true,
       label: "Image",
       required: false,
       isAdvanced: false,
@@ -97,7 +100,7 @@ export const seedreamConfig: NodeConfig = {
       default: 1,
       isAdvanced: true,
       description: "Number of separate model generations",
-      validation: { min: 1, max: 6, step: 1 },
+      validation: { min: 1, max: BILLING_LIMITS.imageGenerations, step: 1 },
     },
     {
       // FIX: Added missing max_images parameter
@@ -108,7 +111,7 @@ export const seedreamConfig: NodeConfig = {
       default: 1,
       isAdvanced: true,
       description: "Enables multi-image generation per prompt",
-      validation: { min: 1, max: 6, step: 1 },
+      validation: { min: 1, max: BILLING_LIMITS.imagesPerGeneration, step: 1 },
     },
     {
       // FIX: Added missing enable_safety_checker parameter
@@ -141,6 +144,7 @@ export const seedreamConfig: NodeConfig = {
       type: "image",
       label: "Image",
     },
+    { key: "image_urls", type: "image", label: "All Images", multi: true },
   ],
 
   // ---------------------------------------------------------------------------
@@ -169,6 +173,7 @@ export const seedreamConfig: NodeConfig = {
           },
           outputMapping: {
             image_url: "image_url",
+            image_urls: "image_urls",
           },
         },
       ],
@@ -176,16 +181,20 @@ export const seedreamConfig: NodeConfig = {
   ],
 
   // ---------------------------------------------------------------------------
-  // CREDITS — Flat estimate, actual from fal.ai response when available
+  // CREDITS — Maximum reservation and usage-based settlement
   // ---------------------------------------------------------------------------
   credits: {
-    estimate: (inputs) => (inputs.mode === "edit" ? 20_000 : 15_000),
+    estimate: () => estimateNodeReservation("seedream-4.5"),
     calculate: (_inputs, response: unknown) => {
       const res = response as Record<string, unknown> | null;
       if (res && typeof res.cost === "number") {
         return Math.ceil(res.cost * 1_000_000);
       }
-      return 15_000;
+      const count = res?.generatedImageCount;
+      if (typeof count !== "number" || !Number.isInteger(count) || count < 1 || count > BILLING_LIMITS.imageGenerations * BILLING_LIMITS.imagesPerGeneration) {
+        throw new Error("Seedream response is missing a valid generated image count");
+      }
+      return count * BILLING_RATES.image;
     },
   },
 

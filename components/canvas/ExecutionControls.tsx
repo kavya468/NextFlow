@@ -1,43 +1,50 @@
 "use client";
 
-import { useStore } from "@/lib/store";
+import { useStore, type NodeRunStatus } from "@/lib/store";
 import { nodeRegistry } from "@/lib/nodes/registry";
 import "@/lib/nodes/configs";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { useState, useRef, useCallback, useEffect } from "react";
-import type { Node, Edge } from "@xyflow/react";
+import type { Node } from "@xyflow/react";
 import { useRealtimeRun } from "@trigger.dev/react-hooks";
 import { PreRunModal } from "@/components/credits/PreRunModal";
 import { CostEstimateTooltip } from "@/components/credits/CostEstimateTooltip";
 import { trpc } from "@/lib/trpc/client";
+import { EDITOR_UI, RUN_UI, dispatchRunStatus, isKnownRequestRejection, isRecord, isTerminalRunStatus } from "@/lib/ui-config";
+import type { ExecuteWorkflowInput } from "@/lib/schemas";
+import type { SavedWorkflow } from "@/hooks/save-coordinator";
 
-function jsonSafeReplacer() {
-  const seen = new WeakSet();
-  return function (this: unknown, _key: string, value: unknown): unknown {
-    if (value !== null && typeof value === "object") {
-      if (seen.has(value as object)) return undefined;
-      if (typeof (value as { nodeType?: number }).nodeType === "number") return undefined;
-      if (typeof (value as { __reactFiber?: unknown }).__reactFiber !== "undefined") return undefined;
-      try {
-        seen.add(value as object);
-      } catch {
-        return undefined;
-      }
-    }
-    if (typeof value === "function") return undefined;
-    return value;
-  };
+export interface ExecutionControlsProps {
+  workflowId?: string;
+  workflowScope: string;
+  prepareWorkflow: () => Promise<SavedWorkflow>;
+  onWorkflowResolved: (id: string) => void;
+  onSaveConflict: (error: unknown) => void;
 }
 
-export function ExecutionControls() {
+type SavedRun = {
+  id: string;
+  status: string;
+  triggerId?: string | null;
+  nodeRuns: Array<{ nodeId: string; status: string; outputs: unknown }>;
+};
+
+type AcceptedRun = {
+  runId: string;
+  workflowId: string;
+  status: string;
+  triggerId?: string;
+  publicAccessToken?: string;
+};
+
+export function ExecutionControls({ workflowScope, prepareWorkflow, onWorkflowResolved, onSaveConflict }: ExecutionControlsProps) {
+  const mountedRef = useRef(false);
+  const isCurrentSession = useCallback(() => mountedRef.current && useStore.getState().workflowScope === workflowScope, [workflowScope]);
   const nodes = useStore((state) => state.nodes);
-  const edges = useStore((state) => state.edges);
   const setRunningNodeIds = useStore((state) => state.setRunningNodeIds);
-  const runningNodeIds = useStore((state) => state.runningNodeIds);
   const setNodeRunStatuses = useStore((state) => state.setNodeRunStatuses);
   const clearNodeRunStatuses = useStore((state) => state.clearNodeRunStatuses);
-  const setNodes = useStore((state) => state.setNodes);
   const undo = useStore((state) => state.undo);
   const redo = useStore((state) => state.redo);
   const pastLength = useStore((state) => state.past.length);
@@ -46,25 +53,7 @@ export function ExecutionControls() {
   const utils = trpc.useUtils();
   const executeMutation = trpc.workflow.execute.useMutation();
   const cancelMutation = trpc.workflow.cancel.useMutation();
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-
-      if ((e.metaKey || e.ctrlKey) && e.key === "z") {
-        e.preventDefault();
-        if (e.shiftKey) {
-          redo();
-        } else {
-          undo();
-        }
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [undo, redo]);
+  const retryDispatchMutation = trpc.workflow.retryDispatch.useMutation();
 
   // ── Execution State ───────────────────────────────────────────────────
   const [isRunning, setIsRunning] = useState(false);
@@ -75,7 +64,34 @@ export function ExecutionControls() {
   const [pendingOverrideNodeIds, setPendingOverrideNodeIds] = useState<string[] | undefined>(undefined);
 
   const currentRunIdRef = useRef<string | null>(null);
-  currentRunIdRef.current = currentRunId;
+  const pendingRequestRef = useRef<ExecuteWorkflowInput | null>(null);
+  const startingRef = useRef(false);
+  const clearStatusesTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [requestUnconfirmed, setRequestUnconfirmed] = useState(false);
+  const [runStatus, setRunStatus] = useState("PENDING");
+  const [awaitingSettlement, setAwaitingSettlement] = useState(false);
+
+  const { data: savedRun, error: statusError } = trpc.workflow.status.useQuery(
+    { runId: currentRunId ?? "" },
+    {
+      enabled: !!currentRunId && isRunning,
+      refetchInterval: (query) => isTerminalRunStatus(query.state.data?.status ?? "") ? false : RUN_UI.pollIntervalMs,
+      refetchIntervalInBackground: true,
+    },
+  );
+  const { data: tokenData } = trpc.workflow.triggerToken.useQuery(
+    { runId: currentRunId ?? "" },
+    { enabled: !!currentRunId && !!triggerId && !accessToken && isRunning },
+  );
+  const realtimeToken = accessToken ?? (tokenData?.triggerId === triggerId ? tokenData.publicAccessToken : null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (clearStatusesTimerRef.current) clearTimeout(clearStatusesTimerRef.current);
+    };
+  }, []);
 
   // Tracks whether we've already handled the terminal state for this run
   // to prevent double-cleanup between onComplete and the useEffect fallback.
@@ -84,6 +100,7 @@ export function ExecutionControls() {
   // ── Shared helper: merge node outputs into React Flow node data ────────
   const syncNodeOutputsToStore = useCallback(
     (outputMap: Record<string, Record<string, unknown>>) => {
+      if (!isCurrentSession()) return;
       const currentNodes = useStore.getState().nodes;
       let changed = false;
       const updatedNodes = currentNodes.map((node) => {
@@ -99,7 +116,7 @@ export function ExecutionControls() {
         if (outputs.text) resultData.result = outputs.text;
         if (outputs.url) resultData.result_url = outputs.url;
 
-        if (Object.keys(resultData).length > 0) {
+        if (Object.entries(resultData).some(([key, value]) => !Object.is(node.data[key], value))) {
           changed = true;
           return { ...node, data: { ...node.data, ...resultData } };
         }
@@ -109,163 +126,104 @@ export function ExecutionControls() {
         useStore.getState().setNodes(updatedNodes);
       }
     },
-    []
+    [isCurrentSession]
   );
 
-  // ── Terminal state handler (shared by onComplete + useEffect fallback) ──
-  const handleRunTerminal = useCallback(
-    (runMeta?: Record<string, unknown>, failed?: boolean) => {
-      if (terminalHandledRef.current) return;
-      if (!currentRunIdRef.current) return;
-      terminalHandledRef.current = true;
-
-      const finishedRunId = currentRunIdRef.current;
-
-      const nodeStatuses = runMeta?.nodeStatuses as Record<string, string> | undefined;
-      if (nodeStatuses) {
-        setNodeRunStatuses(nodeStatuses as Record<string, any>);
+  // Only the saved run can finish the UI and release its monitoring state.
+  const applySavedRun = useCallback((run: SavedRun) => {
+    if (!isCurrentSession() || run.id !== currentRunIdRef.current || terminalHandledRef.current) return;
+    setRunStatus(run.status);
+    if (run.triggerId) setTriggerId(run.triggerId);
+    const statuses: Record<string, NodeRunStatus> = {};
+    const outputs: Record<string, Record<string, unknown>> = {};
+    for (const node of run.nodeRuns) {
+      if (["PENDING", "RUNNING", "SUCCESS", "FAILED", "BLOCKED"].includes(node.status)) {
+        statuses[node.nodeId] = node.status as NodeRunStatus;
       }
-      const nodeOutputs = runMeta?.nodeOutputs as
-        | Record<string, Record<string, unknown>>
-        | undefined;
-      if (nodeOutputs) {
-        syncNodeOutputsToStore(nodeOutputs);
-      }
-
-      setRunningNodeIds([]);
-      setIsRunning(false);
-      window.dispatchEvent(new Event("nextflow:run-complete"));
-      utils.credits.getBalance.invalidate();
-      setTimeout(() => {
-        if (currentRunIdRef.current && currentRunIdRef.current !== finishedRunId) return;
-        clearNodeRunStatuses();
-      }, 4000);
-
-      if (failed) {
-        console.error("Workflow execution failed");
-      }
-
-      // One-shot DB fetch: Electric SQL can deliver the COMPLETED status
-      // event before the last metadata.set("nodeOutputs", …) flush. A
-      // single authoritative read from Prisma guarantees output previews
-      // always appear regardless of SSE event ordering.
-      if (finishedRunId) {
-        utils.client.workflow.status
-          .query({ runId: finishedRunId })
-          .then((run) => {
-            if (!run?.nodeRuns) return;
-            const outputMap: Record<string, Record<string, unknown>> = {};
-            for (const nr of run.nodeRuns) {
-              if ((nr as any).status === "SUCCESS" && (nr as any).outputs) {
-                outputMap[(nr as any).nodeId] = (nr as any).outputs as Record<
-                  string,
-                  unknown
-                >;
-              }
-            }
-            syncNodeOutputsToStore(outputMap);
-          })
-          .catch((err: unknown) =>
-            console.warn("Final output fetch failed:", err)
-          )
-          .finally(() => {
-            if (currentRunIdRef.current && currentRunIdRef.current !== finishedRunId) return;
-            setCurrentRunId(null);
-            setTriggerId(null);
-            setAccessToken(null);
-          });
-      } else {
-        setCurrentRunId(null);
-        setTriggerId(null);
-        setAccessToken(null);
-      }
-    },
-    [setRunningNodeIds, setNodeRunStatuses, clearNodeRunStatuses, syncNodeOutputsToStore, utils.client.workflow.status]
-  );
-
-  // ── Trigger.dev Realtime Subscription ─────────────────────────────────
-  const { run: realtimeRun, error: realtimeError } = useRealtimeRun(
-    triggerId ?? "",
-    {
-      accessToken: accessToken ?? "",
-      enabled: !!triggerId && !!accessToken && isRunning,
-
-      onComplete: (completedRun, completedErr) => {
-        if ((completedRun as any).id !== triggerId) return;
-        const meta = completedRun.metadata as Record<string, unknown> | undefined;
-        handleRunTerminal(meta, !!completedErr || completedRun.status === "FAILED");
-      },
+      if (node.status === "SUCCESS" && isRecord(node.outputs)) outputs[node.nodeId] = node.outputs;
     }
-  );
-
-  // ── Sync Live Metadata → Zustand Store ────────────────────────────────
-  // Fires on every metadata change during execution. Also serves as a
-  // fallback terminal-state detector: if onComplete doesn't fire (race
-  // between isComplete and finishedAt in the hook's SWR state), this
-  // effect catches it via realtimeRun.finishedAt or status fields.
-  useEffect(() => {
-    if (!realtimeRun || !triggerId) return;
-
-    // After a triggerId change, `realtimeRun` can still hold stale data
-    // from the previous subscription until the new one delivers its first
-    // event.  Ignore it so we don't accidentally kill a fresh run.
-    const runId = (realtimeRun as any).id as string | undefined;
-    if (runId && runId !== triggerId) return;
-
-    const meta = realtimeRun.metadata as Record<string, unknown> | undefined;
-
-    // Fallback terminal detection — catches completion even if onComplete
-    // doesn't fire due to hook-internal SWR timing issues.
-    const isTerminal =
-      !!realtimeRun.finishedAt ||
-      (realtimeRun as any).status === "COMPLETED" ||
-      (meta?.runStatus &&
-        ["SUCCESS", "FAILED", "PARTIAL"].includes(meta.runStatus as string));
-
-    if (isTerminal && isRunning) {
-      handleRunTerminal(
-        meta,
-        (realtimeRun as any).status === "FAILED" ||
-          meta?.runStatus === "FAILED"
-      );
+    setNodeRunStatuses(statuses);
+    syncNodeOutputsToStore(outputs);
+    if (!isTerminalRunStatus(run.status)) {
+      setRunningNodeIds(run.nodeRuns.filter(node => node.status === "RUNNING").map(node => node.nodeId));
       return;
     }
-
-    // Once the run has been finalized, don't let stale realtime metadata
-    // re-populate runningNodeIds (which would restart the pulse animation).
-    if (terminalHandledRef.current) return;
-
-    const nodeStatuses = meta?.nodeStatuses as Record<string, string> | undefined;
-    if (nodeStatuses) {
-      setNodeRunStatuses(nodeStatuses as Record<string, any>);
-
-      const runningIds = Object.entries(nodeStatuses)
-        .filter(([, status]) => status === "RUNNING")
-        .map(([id]) => id);
-      setRunningNodeIds(runningIds);
-    }
-
-    const nodeOutputs = meta?.nodeOutputs as
-      | Record<string, Record<string, unknown>>
-      | undefined;
-    if (nodeOutputs) {
-      syncNodeOutputsToStore(nodeOutputs);
-    }
-  }, [
-    realtimeRun,
-    triggerId,
-    isRunning,
-    setRunningNodeIds,
-    setNodeRunStatuses,
-    syncNodeOutputsToStore,
-    handleRunTerminal,
-  ]);
+    terminalHandledRef.current = true;
+    setRunningNodeIds([]);
+    setIsRunning(false);
+    setAwaitingSettlement(false);
+    setCurrentRunId(null);
+    setTriggerId(null);
+    setAccessToken(null);
+    window.dispatchEvent(new Event("nextflow:run-complete"));
+    void utils.credits.getBalance.invalidate();
+    clearStatusesTimerRef.current = setTimeout(() => {
+      if (!isCurrentSession() || currentRunIdRef.current !== run.id) return;
+      clearNodeRunStatuses();
+    }, RUN_UI.nodeStatusClearDelayMs);
+  }, [isCurrentSession, setNodeRunStatuses, syncNodeOutputsToStore, setRunningNodeIds, clearNodeRunStatuses, utils.credits.getBalance]);
 
   useEffect(() => {
-    if (realtimeError) {
-      console.warn("Realtime subscription error:", realtimeError);
+    if (savedRun) applySavedRun(savedRun);
+  }, [savedRun, applySavedRun]);
+
+  const refreshSavedRun = useCallback(async () => {
+    const runId = currentRunIdRef.current;
+    if (!isCurrentSession() || !runId || terminalHandledRef.current) return;
+    setAwaitingSettlement(true);
+    try {
+      const run = await utils.client.workflow.status.query({ runId });
+      applySavedRun(run);
+    } catch {
+      // Polling remains active; a transport failure does not establish run failure.
     }
-  }, [realtimeError]);
+  }, [isCurrentSession, utils.client.workflow.status, applySavedRun]);
+
+  const { run: realtimeRun, error: realtimeError } = useRealtimeRun(triggerId ?? "", {
+    accessToken: realtimeToken ?? "",
+    enabled: !!triggerId && !!realtimeToken && isRunning,
+    onComplete: (completedRun) => {
+      if (completedRun.id === triggerId) void refreshSavedRun();
+    },
+  });
+
+  useEffect(() => {
+    if (!isCurrentSession() || !realtimeRun || realtimeRun.id !== triggerId || terminalHandledRef.current) return;
+    const meta = realtimeRun.metadata as Record<string, unknown> | undefined;
+    if (realtimeRun.finishedAt || realtimeRun.status === "COMPLETED" || isTerminalRunStatus(String(meta?.runStatus ?? ""))) {
+      void refreshSavedRun();
+      return;
+    }
+    if (isRecord(meta?.nodeStatuses)) {
+      const statuses: Record<string, NodeRunStatus> = {};
+      for (const [id, status] of Object.entries(meta.nodeStatuses)) {
+        if (typeof status === "string" && ["PENDING", "RUNNING", "SUCCESS", "FAILED", "BLOCKED"].includes(status)) statuses[id] = status as NodeRunStatus;
+      }
+      setNodeRunStatuses(statuses);
+      setRunningNodeIds(Object.keys(statuses).filter(id => statuses[id] === "RUNNING"));
+    }
+  }, [isCurrentSession, realtimeRun, triggerId, refreshSavedRun, setNodeRunStatuses, setRunningNodeIds]);
+
+  const acceptRun = useCallback((data: AcceptedRun) => {
+    if (!isCurrentSession()) return;
+    currentRunIdRef.current = data.runId;
+    terminalHandledRef.current = false;
+    pendingRequestRef.current = null;
+    setRequestUnconfirmed(false);
+    setCurrentRunId(data.runId);
+    setTriggerId(data.triggerId ?? null);
+    setAccessToken(data.publicAccessToken ?? null);
+    setRunStatus(dispatchRunStatus(data.status));
+    setIsRunning(true);
+    setAwaitingSettlement(false);
+    onWorkflowResolved(data.workflowId);
+    void utils.workflow.history.invalidate();
+    void utils.credits.getBalance.invalidate();
+    if (data.status === "dispatch_unknown") {
+      useStore.getState().setIsRightSidebarOpen(true);
+      toast.info(RUN_UI.messages.dispatchUnknown);
+    }
+  }, [isCurrentSession, onWorkflowResolved, utils.workflow.history, utils.credits.getBalance]);
 
   /**
    * Pre-flight: for every edge where a passthrough text source feeds into a
@@ -311,8 +269,9 @@ export function ExecutionControls() {
 
       try {
         const schema = nodeRegistry.getInputSchema(targetType);
-        const partial = { [targetHandleKey]: sourceValue };
-        const result = schema.pick({ [targetHandleKey]: true } as any).safeParse(partial);
+        const field = schema.shape[targetHandleKey];
+        if (!field) continue;
+        const result = field.safeParse(sourceValue);
 
         if (!result.success) {
           const firstIssue = result.error.issues[0];
@@ -335,74 +294,57 @@ export function ExecutionControls() {
   }, [isRunning, runPreFlightValidation]);
 
   const executeWorkflow = useCallback(async (overrideNodeIds?: string[]) => {
-    if (isRunning) return;
-
+    if (isRunning || startingRef.current) return;
+    startingRef.current = true;
+    currentRunIdRef.current = null;
+    setCurrentRunId(null);
+    setTriggerId(null);
+    setAccessToken(null);
     setIsRunning(true);
+    setAwaitingSettlement(false);
+    setRunStatus("PENDING");
     terminalHandledRef.current = false;
-
-    const selectedNodes = nodes.filter((n) => n.selected && n.type !== "note");
-    const selectedNodeIds =
-      overrideNodeIds ??
-      (selectedNodes.length > 0 ? selectedNodes.map((n) => n.id) : undefined);
-
+    if (clearStatusesTimerRef.current) clearTimeout(clearStatusesTimerRef.current);
     try {
-      const executableNodes = nodes.filter((n) => n.type !== "note");
-
-      const payload = {
-        nodes: executableNodes.map((n) => ({
-          id: n.id,
-          type: n.type,
-          position: n.position,
-          data: (() => {
-            const d = n.data ?? {};
-            try {
-              return JSON.parse(JSON.stringify(d, jsonSafeReplacer()));
-            } catch {
-              return {};
-            }
-          })(),
-        })),
-        edges: edges.map((e) => ({
-          id: e.id,
-          source: e.source,
-          target: e.target,
-          sourceHandle: e.sourceHandle ?? undefined,
-          targetHandle: e.targetHandle ?? undefined,
-        })),
-        ...(selectedNodeIds && { selectedNodeIds }),
-      };
-
-      const data = await executeMutation.mutateAsync(payload as any);
-
-      console.log("Triggered Run:", data);
-      setCurrentRunId(data.runId);
-      setTriggerId(data.triggerId);
-
-      if (data.publicAccessToken) {
-        setAccessToken(data.publicAccessToken);
-      } else {
-        // Initial token mint failed — try the dedicated refresh endpoint
-        try {
-          const tokenData = await utils.client.workflow.triggerToken.query({
-            runId: data.runId,
-          });
-          setAccessToken(tokenData.publicAccessToken);
-        } catch {
-          toast.error("Live updates unavailable — could not create realtime token");
-        }
+      if (!pendingRequestRef.current) {
+        // Run only the acknowledged revision after the entire save queue drains.
+        const savedWorkflow = await prepareWorkflow();
+        if (!isCurrentSession()) return;
+        const selectedNodes = useStore.getState().nodes.filter(node => node.selected && node.type !== "note");
+        const selectedNodeIds = overrideNodeIds ?? (selectedNodes.length ? selectedNodes.map(node => node.id) : undefined);
+        pendingRequestRef.current = {
+          idempotencyKey: crypto.randomUUID(),
+          workflowId: savedWorkflow.id,
+          expectedRevision: savedWorkflow.revision,
+          nodes: savedWorkflow.nodes.filter(node => node.type !== "note").map(node => ({ ...node, type: node.type || "default" })),
+          edges: savedWorkflow.edges,
+          ...(selectedNodeIds && { selectedNodeIds }),
+        };
       }
-    } catch (err: any) {
-      console.error("Failed to start workflow:", err);
-      const msg = err?.message || err?.data?.message || "Workflow execution failed";
-      if (msg.includes("Insufficient credits")) {
-        toast.error(msg);
-      } else {
-        toast.error(msg);
-      }
+      acceptRun(await executeMutation.mutateAsync(pendingRequestRef.current));
+    } catch (error: unknown) {
+      if (!isCurrentSession()) return;
+      if (isRecord(error) && isRecord(error.data) && error.data.code === "CONFLICT") onSaveConflict(error);
+      const knownRejection = isKnownRequestRejection(error);
+      if (knownRejection) pendingRequestRef.current = null;
+      const unconfirmed = !!pendingRequestRef.current;
+      setRequestUnconfirmed(unconfirmed);
+      toast.error(unconfirmed ? RUN_UI.messages.requestUnknown : error instanceof Error ? error.message : "Could not start workflow");
       setIsRunning(false);
       setRunningNodeIds([]);
+    } finally {
+      startingRef.current = false;
     }
-  }, [isRunning, nodes, edges, setRunningNodeIds, executeMutation, utils.client.workflow.triggerToken]);
+  }, [isRunning, prepareWorkflow, isCurrentSession, onSaveConflict, acceptRun, executeMutation, setRunningNodeIds]);
+
+  const retryDispatch = async () => {
+    if (!currentRunId || retryDispatchMutation.isPending) return;
+    try {
+      acceptRun(await retryDispatchMutation.mutateAsync({ runId: currentRunId }));
+    } catch (error: unknown) {
+      if (isCurrentSession()) toast.error(error instanceof Error ? error.message : RUN_UI.messages.dispatchUnknown);
+    }
+  };
 
   // Listen for "Run this node" from context menu / per-node play button
   useEffect(() => {
@@ -414,31 +356,32 @@ export function ExecutionControls() {
     return () => window.removeEventListener("nextflow:run-nodes", handler);
   }, [requestRun]);
 
-  // ── Cancel Handler ──────────────────────────────────────────────────
   const handleCancel = useCallback(async () => {
     if (!currentRunId) return;
-
     try {
-      await cancelMutation.mutateAsync({ runId: currentRunId });
-
-      // Immediately clear ref so onComplete / fallback effect skip cleanup
-      currentRunIdRef.current = null;
-      terminalHandledRef.current = true;
-
-      setIsRunning(false);
-      setRunningNodeIds([]);
-      clearNodeRunStatuses();
-      setCurrentRunId(null);
-      setTriggerId(null);
-      setAccessToken(null);
-      window.dispatchEvent(new Event("nextflow:run-complete"));
-    } catch (err) {
-      console.error("Failed to cancel:", err);
+      const result = await cancelMutation.mutateAsync({ runId: currentRunId });
+      if (!isCurrentSession()) return;
+      setRunStatus(result.status);
+      if (result.status === "CANCEL_REQUESTED") toast.info(RUN_UI.messages.cancellationRequested);
+      await refreshSavedRun();
+    } catch (error: unknown) {
+      if (isCurrentSession()) toast.error(error instanceof Error ? error.message : "Could not request cancellation");
     }
-  }, [currentRunId, cancelMutation, setRunningNodeIds, clearNodeRunStatuses]);
+  }, [isCurrentSession, currentRunId, cancelMutation, refreshSavedRun]);
+
+  const monitoringLabel = runStatus === "DISPATCH_UNKNOWN" ? RUN_UI.labels.dispatchUnknown
+    : runStatus === "CANCEL_REQUESTED" ? RUN_UI.labels.cancelRequested
+    : awaitingSettlement ? RUN_UI.labels.checking
+    : !currentRunId ? RUN_UI.labels.starting
+    : runStatus === "PENDING" ? RUN_UI.labels.pending : RUN_UI.labels.running;
+  const monitoringMessage = statusError ? RUN_UI.messages.statusUnavailable
+    : runStatus === "DISPATCH_UNKNOWN" ? RUN_UI.messages.dispatchUnknown
+    : runStatus === "CANCEL_REQUESTED" ? RUN_UI.messages.cancellationRequested
+    : awaitingSettlement ? RUN_UI.messages.checking
+    : realtimeError ? RUN_UI.messages.liveUnavailable : "";
 
   return (
-    <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-4">
+    <div className="editor-execution-controls" role="group" aria-label={EDITOR_UI.labels.executionControls}>
 
       {/* Undo / Redo */}
       <div className="flex items-center bg-[var(--rf-controls-bg)] border border-[var(--rf-controls-border)] rounded-xl shadow-2xl p-1 gap-1">
@@ -447,6 +390,7 @@ export function ExecutionControls() {
           disabled={pastLength === 0}
           className={`flex items-center justify-center w-8 h-8 rounded-lg transition-colors ${pastLength > 0 ? "text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--toolbar-btn-hover)]" : "text-[var(--text-disabled)] cursor-not-allowed"}`}
           title="Undo (⌘Z)"
+          aria-label={EDITOR_UI.labels.undo}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7v6h6"></path><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path></svg>
         </button>
@@ -455,13 +399,14 @@ export function ExecutionControls() {
           disabled={futureLength === 0}
           className={`flex items-center justify-center w-8 h-8 rounded-lg transition-colors ${futureLength > 0 ? "text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--toolbar-btn-hover)]" : "text-[var(--text-disabled)] cursor-not-allowed"}`}
           title="Redo (⌘⇧Z)"
+          aria-label={EDITOR_UI.labels.redo}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 7v6h-6"></path><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3l3 2.7"></path></svg>
         </button>
       </div>
 
       {/* Run button */}
-      <div className="flex items-center gap-2">
+      <div className="editor-run-actions">
       {(() => {
         const selectedCount = nodes.filter((n) => n.selected && n.type !== "note").length;
         const runLabel =
@@ -478,9 +423,9 @@ export function ExecutionControls() {
               : "Run selected nodes (and their dependencies)";
         return (
           <button
-            onClick={() => requestRun()}
-            disabled={isRunning || nodes.length === 0}
-            title={runTitle}
+            onClick={() => requestUnconfirmed ? void executeWorkflow() : requestRun()}
+            disabled={isRunning || (!requestUnconfirmed && nodes.length === 0)}
+            title={isRunning ? monitoringMessage || monitoringLabel : requestUnconfirmed ? RUN_UI.messages.requestUnknown : runTitle}
             className={`flex items-center justify-center gap-2 px-6 h-12 rounded-xl text-[13px] font-semibold tracking-wide shadow-[0_0_20px_var(--btn-primary-shadow)] transition-all
               ${isRunning
                 ? "bg-[var(--status-running-bg)] text-[var(--status-running)] cursor-not-allowed border border-[var(--status-running-border)]"
@@ -490,12 +435,12 @@ export function ExecutionControls() {
             {isRunning ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Running...</span>
+                <span>{monitoringLabel}</span>
               </>
             ) : (
               <>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 3l14 9-14 9V3z"></path></svg>
-                <span>{runLabel}</span>
+                <span>{requestUnconfirmed ? RUN_UI.labels.retryRequest : runLabel}</span>
                 {!isRunning && nodes.length > 0 && (
                   <CostEstimateTooltip nodes={nodes} />
                 )}
@@ -505,10 +450,16 @@ export function ExecutionControls() {
         );
       })()}
       
+      {isRunning && runStatus === "DISPATCH_UNKNOWN" && (
+        <button type="button" onClick={retryDispatch} disabled={retryDispatchMutation.isPending}
+          className="flex items-center justify-center px-4 h-12 rounded-xl text-[13px] font-semibold border border-[var(--rf-controls-border)] bg-[var(--rf-controls-bg)] text-[var(--text-primary)] hover:bg-[var(--toolbar-btn-hover)]">
+          {retryDispatchMutation.isPending ? RUN_UI.labels.retryingDispatch : RUN_UI.labels.retryDispatch}
+        </button>
+      )}
       {isRunning && (
         <button
           onClick={handleCancel}
-          disabled={!currentRunId || cancelMutation.isPending}
+          disabled={!currentRunId || cancelMutation.isPending || runStatus === "CANCEL_REQUESTED"}
           className={`flex items-center justify-center px-4 h-12 rounded-xl text-[13px] font-semibold tracking-wide transition-all border
             ${cancelMutation.isPending
               ? "bg-[var(--btn-danger-disabled-bg)] text-[var(--status-error-muted)] border-[var(--btn-danger-disabled-border)] cursor-wait"
@@ -519,15 +470,16 @@ export function ExecutionControls() {
           {cancelMutation.isPending ? (
             <>
               <Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" />
-              Canceling...
+              {RUN_UI.labels.cancelling}
             </>
           ) : (
-            "Cancel"
+            runStatus === "CANCEL_REQUESTED" ? RUN_UI.labels.cancelRequested : RUN_UI.labels.cancel
           )}
         </button>
       )}
       </div>
 
+      <span className="sr-only" role="status" aria-live="polite">{isRunning ? `${monitoringLabel}. ${monitoringMessage}` : requestUnconfirmed ? RUN_UI.messages.requestUnknown : ""}</span>
       <PreRunModal
         open={showPreRunModal}
         onOpenChange={setShowPreRunModal}

@@ -1,5 +1,7 @@
-import { logger, task } from "@trigger.dev/sdk/v3";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { publicFetch } from "../../lib/safe-fetch";
+import { logger, task } from "@trigger.dev/sdk";
+import { GoogleGenerativeAI, type Part } from "@google/generative-ai";
+import { validateLlmBillingInputs } from "../../lib/credits/billing-policy";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
@@ -8,27 +10,31 @@ export const generateLlmContent = task({
     preset: "large-2x",
   },
   id: "generate-llm-content",
-  // ── Retry with exponential backoff ────────────────────────────────────
-  // Gemini API frequently returns 503 under load. Trigger.dev's built-in
-  // retry handles this at the infrastructure level — we never need manual
-  // retry loops inside the run() function.
+  // Never replay a whole paid task after an ambiguous provider outcome.
+  // The bounded retry below handles explicit rate-limit rejections only.
   retry: {
-    maxAttempts: 5,
-    factor: 2,
-    minTimeoutInMs: 2000,
-    maxTimeoutInMs: 30000,
+    maxAttempts: 1,
   },
   run: async (payload: {
     model?: string;
     systemPrompt?: string;
     userMessage?: string;
     images?: string[];
+    max_tokens?: number;
+    temperature?: number;
   }) => {
+    validateLlmBillingInputs("llm", {
+      model: payload.model,
+      user_message: payload.userMessage,
+      system_prompt: payload.systemPrompt,
+      images: payload.images,
+      max_tokens: payload.max_tokens,
+    });
     logger.info("Starting Gemini LLM generation", { model: payload.model });
 
     // ── Payload Validation ──────────────────────────────────────────────
     if (!payload.userMessage || typeof payload.userMessage !== "string" || payload.userMessage.trim() === "") {
-      logger.error("Missing or empty userMessage in payload", { payload });
+      logger.error("Missing or empty userMessage in payload");
       throw new Error(
         "LLM generation failed: A non-empty user message is required. " +
         "Ensure the 'User Message' input is connected or has a value."
@@ -53,21 +59,21 @@ export const generateLlmContent = task({
     const model = genAI.getGenerativeModel({
       model: actualModel,
       ...(payload.systemPrompt && { systemInstruction: payload.systemPrompt }),
+      generationConfig: {
+        maxOutputTokens: payload.max_tokens ?? 2048,
+        ...(payload.temperature !== undefined && { temperature: payload.temperature }),
+      },
     });
 
-    const parts: any[] = [{ text: payload.userMessage }];
+    const parts: Part[] = [{ text: payload.userMessage }];
 
     // ── Multimodal vision support ─────────────────────────────────────
-    for (const imageUrl of sanitizedImages) {
+    for (const [index, imageUrl] of sanitizedImages.entries()) {
       try {
-        logger.info("Fetching image for vision support", { url: imageUrl });
-        const response = await fetch(imageUrl);
+        logger.info("Fetching image for vision support", { imageNumber: index + 1 });
+        const response = await publicFetch(imageUrl, { maxBytes: 20 * 1024 * 1024 });
         if (!response.ok) {
-          logger.warn("Failed to fetch vision image, skipping", {
-            url: imageUrl,
-            status: response.status,
-          });
-          continue;
+          throw new Error("Image download was rejected");
         }
         const arrayBuffer = await response.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
@@ -78,20 +84,18 @@ export const generateLlmContent = task({
             mimeType: response.headers.get("content-type") || "image/jpeg",
           },
         });
-      } catch (imgErr: any) {
-        logger.warn("Error processing vision image, skipping", {
-          url: imageUrl,
-          error: imgErr.message,
-        });
+      } catch {
+        // Image URLs and download errors can contain signed credentials.
+        // Fail before generation instead of silently changing the requested input.
+        throw new Error(`Failed to load vision image ${index + 1}. Check that the image is accessible.`);
       }
     }
 
     // ── Gemini API Call with In-Task Retry ───────────────────────────────
-    // Trigger.dev's task-level retry restarts the ENTIRE run (re-fetches
-    // images, re-builds parts). For transient 503/429 errors, an in-task
-    // retry is much cheaper — it retries just the generateContent() call.
-    const MAX_API_RETRIES = 6;
-    const BASE_DELAY_MS = 3000; // 3s → 6s → 12s → 24s → 48s → 60s
+    // Only explicit 429 rejections may be retried, up to three total calls.
+    // A 5xx or transport failure can follow billable work and must not be replayed.
+    const MAX_API_RETRIES = 3;
+    const BASE_DELAY_MS = 3000;
 
     for (let attempt = 1; attempt <= MAX_API_RETRIES; attempt++) {
       try {
@@ -104,19 +108,31 @@ export const generateLlmContent = task({
           outputLength: text.length,
           attempt,
         });
-        return { text };
-      } catch (error: any) {
-        const statusCode = error.status || error.httpStatusCode || 0;
-        const isRetryable = statusCode === 503 || statusCode === 429 || statusCode >= 500;
+        const usage = response.usageMetadata;
+        return {
+          text,
+          ...(usage && {
+            usage: {
+              prompt_tokens: usage.promptTokenCount,
+              // total includes reasoning tokens omitted from candidatesTokenCount.
+              completion_tokens: Math.max(usage.candidatesTokenCount, usage.totalTokenCount - usage.promptTokenCount),
+            },
+          }),
+        };
+      } catch (error: unknown) {
+        const statusCode = typeof error === "object" && error !== null
+          ? "status" in error && typeof error.status === "number" ? error.status
+            : "httpStatusCode" in error && typeof error.httpStatusCode === "number" ? error.httpStatusCode : 0
+          : 0;
+        const isRetryable = statusCode === 429;
 
         logger.error(`Gemini API call failed (attempt ${attempt}/${MAX_API_RETRIES})`, {
-          error: error.message,
+          errorType: error instanceof Error ? error.name : "UnknownError",
           status: statusCode,
           retryable: isRetryable,
         });
 
-        // Non-retryable errors (400 Bad Request, 401 Unauthorized, 403 Forbidden)
-        // fail immediately — no point retrying with the same payload.
+        // Every other failure ends this attempt without another provider call.
         if (!isRetryable || attempt === MAX_API_RETRIES) {
           throw error;
         }

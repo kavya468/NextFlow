@@ -1,3 +1,4 @@
+import { publicFetch, LOCAL_MEDIA_INPUT_OPTIONS } from "../../lib/safe-fetch";
 import { logger, task } from "@trigger.dev/sdk/v3";
 import crypto from "crypto";
 import ffmpeg from "fluent-ffmpeg";
@@ -50,7 +51,8 @@ async function pollAssembly(assemblyUrl: string): Promise<unknown> {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < ASSEMBLY_TIMEOUT_MS) {
-    const response = await fetch(assemblyUrl, {
+    const response = await publicFetch(assemblyUrl, {
+      maxBytes: 1024 * 1024,
       signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
     });
 
@@ -144,7 +146,7 @@ async function ensureVideoHasAudio(inputPath: string): Promise<void> {
   const metadata = await new Promise<{
     streams?: Array<{ codec_type?: string }>;
   }>((resolve, reject) => {
-    ffmpeg.ffprobe(inputPath, (error, data) => {
+    ffmpeg.ffprobe(inputPath, LOCAL_MEDIA_INPUT_OPTIONS, (error, data) => {
       if (error) {
         reject(new Error(`ffprobe failed: ${error.message}`));
         return;
@@ -162,6 +164,7 @@ async function ensureVideoHasAudio(inputPath: string): Promise<void> {
 async function extractAudioTrack(inputPath: string, outputPath: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     ffmpeg(inputPath)
+      .inputOptions(LOCAL_MEDIA_INPUT_OPTIONS)
       .noVideo()
       .outputOptions(["-map 0:a:0", "-q:a 2"])
       .audioCodec("libmp3lame")
@@ -201,7 +204,7 @@ export const ffmpegExtractAudioTask = task({
         videoUrl: input.video_url,
       });
 
-      const videoResponse = await fetch(input.video_url, {
+      const videoResponse = await publicFetch(input.video_url, {
         signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
       });
 

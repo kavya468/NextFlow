@@ -22,9 +22,12 @@ type Snapshot = { nodes: AppNode[]; edges: Edge[] };
 
 const MAX_HISTORY = 50;
 
-export type NodeRunStatus = "PENDING" | "RUNNING" | "SUCCESS" | "FAILED";
+export type NodeRunStatus = "PENDING" | "RUNNING" | "SUCCESS" | "FAILED" | "BLOCKED";
 
 export type AppState = {
+  workflowScope: string | null;
+  loadWorkflow: (scope: string, nodes: AppNode[], edges: Edge[]) => void;
+  clearWorkflow: (scope: string) => void;
   nodes: AppNode[];
   edges: Edge[];
   runningNodeIds: string[];
@@ -61,6 +64,18 @@ export type AppState = {
 };
 
 export const useStore = create<AppState>((set, get) => ({
+  workflowScope: null,
+  loadWorkflow: (scope, nodes, edges) => set({
+    workflowScope: scope,
+    nodes: structuredClone(nodes).map(node => ({ ...node, selected: false })),
+    edges: structuredClone(edges).map(edge => ({ ...edge, selected: false })),
+    clipboard: { nodes: [], edges: [] }, past: [], future: [],
+    runningNodeIds: [], nodeRunStatuses: {},
+  }),
+  clearWorkflow: scope => {
+    if (get().workflowScope !== scope) return;
+    set({ workflowScope: null, nodes: [], edges: [], clipboard: { nodes: [], edges: [] }, past: [], future: [], runningNodeIds: [], nodeRunStatuses: {} });
+  },
   nodes: [],
   edges: [],
   runningNodeIds: [],
