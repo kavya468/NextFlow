@@ -81,6 +81,9 @@ export default async function DashboardPage() {
               </svg>
               Browse Templates
             </Link>
+            <Link href={APP_UI.demo.href} className="demo-dashboard-link">
+              {APP_UI.demo.linkLabel}
+            </Link>
           </div>
         </div>
       </div>

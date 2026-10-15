@@ -4,6 +4,29 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* The product film shares the application's theme and needs no autoplay or client state. */
+.demo-page { min-height: 100vh; background: var(--canvas-bg); color: var(--text-primary); padding: clamp(1.25rem, 4vw, 3rem); }
+.demo-shell { max-width: 68rem; margin-inline: auto; }
+.demo-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: clamp(2rem, 6vw, 4rem); }
+.demo-brand { font-size: 1.25rem; font-weight: 600; letter-spacing: -0.03em; }
+.demo-studio-link { padding: 0.65rem 1rem; border: 1px solid var(--node-border); border-radius: var(--editor-control-radius); background: var(--panel-bg); }
+.demo-title { font-size: clamp(2rem, 5vw, 3.5rem); line-height: 1.1; font-weight: 600; letter-spacing: -0.035em; text-wrap: balance; }
+.demo-description { max-width: 42rem; margin-block: 1rem 2rem; color: var(--text-secondary); line-height: 1.6; }
+.demo-video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; border-radius: var(--editor-control-radius); background: var(--color-background); }
+.demo-caption { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; margin-block: 1rem 1.5rem; color: var(--text-secondary); font-size: 0.875rem; line-height: 1.5; }
+.demo-caption p { max-width: 48rem; }
+.demo-caption a { flex-shrink: 0; }
+.demo-transcript { padding-block: 1rem; border-block: 1px solid var(--node-border); font-size: 0.875rem; line-height: 1.65; }
+.demo-transcript summary { cursor: pointer; font-weight: 500; }
+.demo-transcript p { margin-top: 0.75rem; color: var(--text-secondary); }
+.demo-credits { margin-top: 2rem; font-size: 0.8125rem; line-height: 1.7; color: var(--text-secondary); }
+.demo-credits p { margin-top: 0.5rem; }
+.demo-caption a, .demo-credits a { text-decoration: underline; text-underline-offset: 0.2em; }
+.demo-dashboard-link { display: inline-flex; align-items: center; width: fit-content; padding: 0.625rem 1.5rem; border: 1px solid currentColor; border-radius: 999px; font-size: 0.875rem; font-weight: 500; color: inherit; }
+.demo-dashboard-link:hover { text-decoration: underline; text-underline-offset: 0.2em; }
+.demo-studio-link:hover { background: var(--hover-bg); }
+.demo-page a:focus-visible, .demo-page summary:focus-visible, .demo-video:focus-visible, .demo-dashboard-link:focus-visible { outline: var(--editor-focus-width) solid currentColor; outline-offset: var(--editor-focus-offset); }
+
 @theme {
   --color-background: #09090b;
   /* Zinc 950 */
